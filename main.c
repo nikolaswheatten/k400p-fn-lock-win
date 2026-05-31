@@ -75,23 +75,23 @@ static int send_packet(hid_device *handle, const unsigned char *packet, int len,
 static int get_feature_index(hid_device *handle, unsigned char device_index, unsigned short feature_id,
     unsigned char *feature_index_out)
 {
-    unsigned char request[SEQ_LEN];
+    unsigned char pkt[SEQ_LEN];
     unsigned char response[65];
     int read_res;
 
-    request[0] = 0x10;
-    request[1] = device_index;
-    request[2] = 0x00;
-    request[3] = 0x00 | SW_ID;
-    request[4] = (unsigned char)((feature_id >> 8) & 0xFF);
-    request[5] = (unsigned char)(feature_id & 0xFF);
-    request[6] = 0x00;
+    pkt[0] = 0x10;
+    pkt[1] = device_index;
+    pkt[2] = 0x00;
+    pkt[3] = 0x00 | SW_ID;
+    pkt[4] = (unsigned char)((feature_id >> 8) & 0xFF);
+    pkt[5] = (unsigned char)(feature_id & 0xFF);
+    pkt[6] = 0x00;
 
     // #region agent log
-    debug_log_hex("K", "main.c:get_feature", "get_feature_request", request, SEQ_LEN);
+    debug_log_hex("K", "main.c:get_feature", "get_feature_request", pkt, SEQ_LEN);
     // #endregion
 
-    read_res = send_packet(handle, request, SEQ_LEN, response, sizeof(response));
+    read_res = send_packet(handle, pkt, SEQ_LEN, response, sizeof(response));
     // #region agent log
     debug_log_hex("K", "main.c:get_feature", "get_feature_response", response, read_res > 0 ? read_res : 0);
     // #endregion
@@ -108,23 +108,23 @@ static int get_feature_index(hid_device *handle, unsigned char device_index, uns
 static int set_fn_lock_packet(hid_device *handle, unsigned char device_index, unsigned char feature_index,
     unsigned char function_with_swid, unsigned char param)
 {
-    unsigned char request[SEQ_LEN];
+    unsigned char pkt[SEQ_LEN];
     unsigned char response[65];
     int read_res;
 
-    request[0] = 0x10;
-    request[1] = device_index;
-    request[2] = feature_index;
-    request[3] = function_with_swid;
-    request[4] = param;
-    request[5] = 0x00;
-    request[6] = 0x00;
+    pkt[0] = 0x10;
+    pkt[1] = device_index;
+    pkt[2] = feature_index;
+    pkt[3] = function_with_swid;
+    pkt[4] = param;
+    pkt[5] = 0x00;
+    pkt[6] = 0x00;
 
     // #region agent log
-    debug_log_hex("K", "main.c:set_fn", "set_fn_request", request, SEQ_LEN);
+    debug_log_hex("K", "main.c:set_fn", "set_fn_request", pkt, SEQ_LEN);
     // #endregion
 
-    read_res = send_packet(handle, request, SEQ_LEN, response, sizeof(response));
+    read_res = send_packet(handle, pkt, SEQ_LEN, response, sizeof(response));
     // #region agent log
     debug_log_hex("K", "main.c:set_fn", "set_fn_response", response, read_res > 0 ? read_res : 0);
     // #endregion
