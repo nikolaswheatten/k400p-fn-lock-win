@@ -5,7 +5,7 @@
 
 #include <hidapi.h>
 
-static const int SEQ_LEN = 7;
+#define HIDPP_PKT_LEN 7
 static const int K400P_VID = 0x46d;
 static const int K400P_PID = 0xc52b;
 static const int TARGET_USAGE = 1;
@@ -75,7 +75,7 @@ static int send_packet(hid_device *handle, const unsigned char *packet, int len,
 static int get_feature_index(hid_device *handle, unsigned char device_index, unsigned short feature_id,
     unsigned char *feature_index_out)
 {
-    unsigned char pkt[SEQ_LEN];
+    unsigned char pkt[HIDPP_PKT_LEN];
     unsigned char response[65];
     int read_res;
 
@@ -88,10 +88,10 @@ static int get_feature_index(hid_device *handle, unsigned char device_index, uns
     pkt[6] = 0x00;
 
     // #region agent log
-    debug_log_hex("K", "main.c:get_feature", "get_feature_request", pkt, SEQ_LEN);
+    debug_log_hex("K", "main.c:get_feature", "get_feature_request", pkt, HIDPP_PKT_LEN);
     // #endregion
 
-    read_res = send_packet(handle, pkt, SEQ_LEN, response, sizeof(response));
+    read_res = send_packet(handle, pkt, HIDPP_PKT_LEN, response, sizeof(response));
     // #region agent log
     debug_log_hex("K", "main.c:get_feature", "get_feature_response", response, read_res > 0 ? read_res : 0);
     // #endregion
@@ -108,7 +108,7 @@ static int get_feature_index(hid_device *handle, unsigned char device_index, uns
 static int set_fn_lock_packet(hid_device *handle, unsigned char device_index, unsigned char feature_index,
     unsigned char function_with_swid, unsigned char param)
 {
-    unsigned char pkt[SEQ_LEN];
+    unsigned char pkt[HIDPP_PKT_LEN];
     unsigned char response[65];
     int read_res;
 
@@ -121,10 +121,10 @@ static int set_fn_lock_packet(hid_device *handle, unsigned char device_index, un
     pkt[6] = 0x00;
 
     // #region agent log
-    debug_log_hex("K", "main.c:set_fn", "set_fn_request", pkt, SEQ_LEN);
+    debug_log_hex("K", "main.c:set_fn", "set_fn_request", pkt, HIDPP_PKT_LEN);
     // #endregion
 
-    read_res = send_packet(handle, pkt, SEQ_LEN, response, sizeof(response));
+    read_res = send_packet(handle, pkt, HIDPP_PKT_LEN, response, sizeof(response));
     // #region agent log
     debug_log_hex("K", "main.c:set_fn", "set_fn_response", response, read_res > 0 ? read_res : 0);
     // #endregion
@@ -181,9 +181,9 @@ static int try_fn_lock(hid_device *handle)
         return 0;
 
     // #region agent log
-    debug_log_hex("L", "main.c:fallback", "legacy_fn_lock_request", LEGACY_FN_LOCK, SEQ_LEN);
+    debug_log_hex("L", "main.c:fallback", "legacy_fn_lock_request", LEGACY_FN_LOCK, HIDPP_PKT_LEN);
     // #endregion
-    if (send_packet(handle, LEGACY_FN_LOCK, SEQ_LEN, response, sizeof(response)) >= 0)
+    if (send_packet(handle, LEGACY_FN_LOCK, HIDPP_PKT_LEN, response, sizeof(response)) >= 0)
         return 0;
 
     return -1;
