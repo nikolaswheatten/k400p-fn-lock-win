@@ -11,6 +11,7 @@ static const int K400P_VID = 0x46d;
 static const int K400P_PID = 0xc52b;
 static const int TARGET_USAGE = 1;
 static const int TARGET_USAGE_PAGE = 65280;
+static const char *DEBUG_RUN_ID = "post-fix";
 
 // #region agent log
 static void debug_log(const char *hypothesisId, const char *location, const char *message, const char *dataJson)
@@ -31,9 +32,9 @@ static void debug_log(const char *hypothesisId, const char *location, const char
         if (f)
         {
             fprintf(f,
-                "{\"sessionId\":\"033532\",\"runId\":\"pre-fix\",\"hypothesisId\":\"%s\","
+                "{\"sessionId\":\"033532\",\"runId\":\"%s\",\"hypothesisId\":\"%s\","
                 "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n",
-                hypothesisId, location, message, dataJson ? dataJson : "{}", ts);
+                DEBUG_RUN_ID, hypothesisId, location, message, dataJson ? dataJson : "{}", ts);
             fclose(f);
             break;
         }
@@ -112,7 +113,7 @@ int main(void)
             if (handle == NULL)
                 break;
 
-            res = hid_write(handle, K400P_SEQ_FN_LOCK, SEQ_LEN);
+            res = hid_send_feature_report(handle, K400P_SEQ_FN_LOCK, SEQ_LEN);
             // #region agent log
             {
                 const wchar_t *err = hid_error(handle);
@@ -123,9 +124,9 @@ int main(void)
                     wcstombs(err_utf8, err, sizeof(err_utf8) - 1);
                 }
                 snprintf(buf, sizeof(buf),
-                    "{\"write_result\":%d,\"expected\":%d,\"hid_error\":\"%s\"}",
+                    "{\"method\":\"hid_send_feature_report\",\"report_result\":%d,\"expected\":%d,\"hid_error\":\"%s\"}",
                     res, SEQ_LEN, err_utf8);
-                debug_log("D", "main.c:write", "hid_write_result", buf);
+                debug_log("F", "main.c:feature_report", "hid_send_feature_report_result", buf);
             }
             // #endregion
             if (res != SEQ_LEN)
