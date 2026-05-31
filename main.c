@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include <hidapi.h>
 
@@ -9,27 +12,122 @@ static const int K400P_PID = 0xc52b;
 static const int TARGET_USAGE = 1;
 static const int TARGET_USAGE_PAGE = 65280;
 
+// #region agent log
+static void debug_log(const char *hypothesisId, const char *location, const char *message, const char *dataJson)
+{
+    FILE *f;
+    const char *paths[] = {
+        "debug-033532.log",
+        "..\\debug-033532.log",
+        "d:\\Desk\\k400p-fn-lock-win-main\\debug-033532.log",
+        NULL
+    };
+    long long ts = (long long)time(NULL) * 1000;
+    int i;
+
+    for (i = 0; paths[i]; i++)
+    {
+        f = fopen(paths[i], "a");
+        if (f)
+        {
+            fprintf(f,
+                "{\"sessionId\":\"033532\",\"runId\":\"pre-fix\",\"hypothesisId\":\"%s\","
+                "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n",
+                hypothesisId, location, message, dataJson ? dataJson : "{}", ts);
+            fclose(f);
+            break;
+        }
+    }
+}
+// #endregion
+
 int main(void)
 {
     int res;
     int result = 1;
+    int device_count = 0;
+    int match_count = 0;
     hid_device *handle;
     struct hid_device_info *devs, *cur_dev;
 
-    if (hid_init() != 0)
+    // #region agent log
+    debug_log("E", "main.c:main", "program_start", "{}");
+    // #endregion
+
+    res = hid_init();
+    // #region agent log
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"hid_init_result\":%d}", res);
+        debug_log("E", "main.c:hid_init", "hid_init_done", buf);
+    }
+    // #endregion
+    if (res != 0)
         return 1;
 
     devs = hid_enumerate(K400P_VID, K400P_PID);
     cur_dev = devs;
     while (cur_dev)
     {
+        device_count++;
+        // #region agent log
+        {
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                "{\"index\":%d,\"vid\":\"0x%04x\",\"pid\":\"0x%04x\",\"usage\":%d,"
+                "\"usage_page\":%d,\"path\":\"%s\",\"matches_target\":%s}",
+                device_count,
+                cur_dev->vendor_id,
+                cur_dev->product_id,
+                cur_dev->usage,
+                cur_dev->usage_page,
+                cur_dev->path ? cur_dev->path : "",
+                (cur_dev->usage == TARGET_USAGE && cur_dev->usage_page == TARGET_USAGE_PAGE) ? "true" : "false");
+            debug_log("A", "main.c:enumerate", "hid_device_found", buf);
+        }
+        // #endregion
+
         if (cur_dev->usage == TARGET_USAGE && cur_dev->usage_page == TARGET_USAGE_PAGE)
         {
+            match_count++;
+            // #region agent log
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "{\"path\":\"%s\",\"match_index\":%d}",
+                    cur_dev->path ? cur_dev->path : "", match_count);
+                debug_log("B", "main.c:match", "target_interface_matched", buf);
+            }
+            // #endregion
+
             handle = hid_open_path(cur_dev->path);
+            // #region agent log
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "{\"open_ok\":%s,\"path\":\"%s\"}",
+                    handle ? "true" : "false",
+                    cur_dev->path ? cur_dev->path : "");
+                debug_log("C", "main.c:open", "hid_open_path_result", buf);
+            }
+            // #endregion
             if (handle == NULL)
                 break;
 
             res = hid_write(handle, K400P_SEQ_FN_LOCK, SEQ_LEN);
+            // #region agent log
+            {
+                const wchar_t *err = hid_error(handle);
+                char err_utf8[256] = "";
+                char buf[512];
+                if (err && err[0])
+                {
+                    wcstombs(err_utf8, err, sizeof(err_utf8) - 1);
+                }
+                snprintf(buf, sizeof(buf),
+                    "{\"write_result\":%d,\"expected\":%d,\"hid_error\":\"%s\"}",
+                    res, SEQ_LEN, err_utf8);
+                debug_log("D", "main.c:write", "hid_write_result", buf);
+            }
+            // #endregion
             if (res != SEQ_LEN)
                 fprintf(stderr, "error: %ls\n", hid_error(handle));
 
@@ -39,6 +137,16 @@ int main(void)
         }
         cur_dev = cur_dev->next;
     }
+
+    // #region agent log
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "{\"device_count\":%d,\"match_count\":%d,\"exit_code\":%d}",
+            device_count, match_count, result);
+        debug_log("A", "main.c:exit", "program_finish", buf);
+    }
+    // #endregion
 
     hid_free_enumeration(devs);
     hid_exit();
