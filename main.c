@@ -3,21 +3,17 @@
 #include <string.h>
 #include <time.h>
 
-#include <windows.h>
-#include <hidsdi.h>
-#include <hidpi.h>
-
 #include <hidapi.h>
 
-#pragma comment(lib, "hid.lib")
-
 static const int SEQ_LEN = 7;
-static const unsigned char K400P_SEQ_FN_LOCK[] = {0x10, 0x01, 0x09, 0x19, 0x00, 0x00, 0x00};
 static const int K400P_VID = 0x46d;
 static const int K400P_PID = 0xc52b;
 static const int TARGET_USAGE = 1;
 static const int TARGET_USAGE_PAGE = 65280;
-static const char *DEBUG_RUN_ID = "post-fix-v2";
+static const unsigned char SW_ID = 0x0B;
+static const char *DEBUG_RUN_ID = "post-fix-v3";
+
+static const unsigned char LEGACY_FN_LOCK[] = {0x10, 0x01, 0x09, 0x19, 0x00, 0x00, 0x00};
 
 // #region agent log
 static void debug_log(const char *hypothesisId, const char *location, const char *message, const char *dataJson)
@@ -46,136 +42,151 @@ static void debug_log(const char *hypothesisId, const char *location, const char
         }
     }
 }
+
+static void debug_log_hex(const char *hypothesisId, const char *location, const char *message,
+    const unsigned char *buf, int len)
+{
+    char data[512];
+    char hex[256];
+    int i, pos = 0;
+
+    for (i = 0; i < len && pos < (int)sizeof(hex) - 3; i++)
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", buf[i]);
+
+    snprintf(data, sizeof(data), "{\"len\":%d,\"hex\":\"%s\"}", len, hex);
+    debug_log(hypothesisId, location, message, data);
+}
 // #endregion
 
-static int path_to_wide(const char *path, wchar_t *wpath, size_t wpath_len)
+static int send_packet(hid_device *handle, const unsigned char *packet, int len, unsigned char *response, int response_cap)
 {
-    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, (int)wpath_len) == 0)
-        return 0;
-    return 1;
+    int res;
+    int read_res;
+
+    res = hid_write(handle, packet, len);
+    if (res != len)
+        return -1;
+
+    memset(response, 0, response_cap);
+    read_res = hid_read_timeout(handle, response, response_cap, 500);
+    return read_res;
 }
 
-static int send_fn_lock(const char *path, hid_device *handle)
+static int get_feature_index(hid_device *handle, unsigned char device_index, unsigned short feature_id,
+    unsigned char *feature_index_out)
 {
-    unsigned char buf[65];
-    wchar_t wpath[512];
-    HANDLE win_handle = INVALID_HANDLE_VALUE;
-    PHIDP_PREPARSED_DATA preparsed = NULL;
-    HIDP_CAPS caps;
-    DWORD gle = 0;
-    ULONG report_len = SEQ_LEN;
-    BOOL ok;
-    int hidapi_result = -1;
-    int any_success = 0;
+    unsigned char request[SEQ_LEN];
+    unsigned char response[65];
+    int read_res;
 
-    memset(&caps, 0, sizeof(caps));
-    memset(buf, 0, sizeof(buf));
-    memcpy(buf, K400P_SEQ_FN_LOCK, SEQ_LEN);
+    request[0] = 0x10;
+    request[1] = device_index;
+    request[2] = 0x00;
+    request[3] = 0x00 | SW_ID;
+    request[4] = (unsigned char)((feature_id >> 8) & 0xFF);
+    request[5] = (unsigned char)(feature_id & 0xFF);
+    request[6] = 0x00;
 
-    if (path_to_wide(path, wpath, sizeof(wpath) / sizeof(wpath[0])))
+    // #region agent log
+    debug_log_hex("K", "main.c:get_feature", "get_feature_request", request, SEQ_LEN);
+    // #endregion
+
+    read_res = send_packet(handle, request, SEQ_LEN, response, sizeof(response));
+    // #region agent log
+    debug_log_hex("K", "main.c:get_feature", "get_feature_response", response, read_res > 0 ? read_res : 0);
+    // #endregion
+
+    if (read_res >= 6 && response[5] != 0x00)
     {
-        win_handle = CreateFileW(
-            wpath,
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            OPEN_EXISTING,
-            0,
-            NULL);
-        gle = GetLastError();
-        // #region agent log
-        {
-            char logbuf[128];
-            snprintf(logbuf, sizeof(logbuf),
-                "{\"open_rw_ok\":%s,\"win32_error\":%lu}",
-                win_handle != INVALID_HANDLE_VALUE ? "true" : "false", gle);
-            debug_log("H", "main.c:win32_open", "create_file_rw", logbuf);
-        }
-        // #endregion
+        *feature_index_out = response[5];
+        return 0;
+    }
 
-        if (win_handle == INVALID_HANDLE_VALUE)
+    return -1;
+}
+
+static int set_fn_lock_packet(hid_device *handle, unsigned char device_index, unsigned char feature_index,
+    unsigned char function_with_swid, unsigned char param)
+{
+    unsigned char request[SEQ_LEN];
+    unsigned char response[65];
+    int read_res;
+
+    request[0] = 0x10;
+    request[1] = device_index;
+    request[2] = feature_index;
+    request[3] = function_with_swid;
+    request[4] = param;
+    request[5] = 0x00;
+    request[6] = 0x00;
+
+    // #region agent log
+    debug_log_hex("K", "main.c:set_fn", "set_fn_request", request, SEQ_LEN);
+    // #endregion
+
+    read_res = send_packet(handle, request, SEQ_LEN, response, sizeof(response));
+    // #region agent log
+    debug_log_hex("K", "main.c:set_fn", "set_fn_response", response, read_res > 0 ? read_res : 0);
+    // #endregion
+
+    return (read_res >= 0) ? 0 : -1;
+}
+
+static int try_fn_lock(hid_device *handle)
+{
+    unsigned char feature_index = 0;
+    unsigned char device_indices[] = {0x01, 0xFF};
+    unsigned char response[65];
+    int i;
+
+    for (i = 0; i < 2; i++)
+    {
+        unsigned char dev_idx = device_indices[i];
+
+        if (get_feature_index(handle, dev_idx, 0x40A2, &feature_index) == 0)
         {
-            win_handle = CreateFileW(
-                wpath,
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                NULL,
-                OPEN_EXISTING,
-                0,
-                NULL);
-            gle = GetLastError();
             // #region agent log
             {
-                char logbuf[128];
-                snprintf(logbuf, sizeof(logbuf),
-                    "{\"open_ro_ok\":%s,\"win32_error\":%lu}",
-                    win_handle != INVALID_HANDLE_VALUE ? "true" : "false", gle);
-                debug_log("H", "main.c:win32_open", "create_file_ro", logbuf);
+                char buf[96];
+                snprintf(buf, sizeof(buf),
+                    "{\"device_index\":%u,\"feature_index\":%u,\"feature_id\":\"0x40A2\"}",
+                    dev_idx, feature_index);
+                debug_log("K", "main.c:discover", "found_new_fn_inversion", buf);
             }
             // #endregion
+            if (set_fn_lock_packet(handle, dev_idx, feature_index, 0x10 | SW_ID, 0x00) == 0)
+                return 0;
         }
-    }
 
-    if (win_handle != INVALID_HANDLE_VALUE)
-    {
-        if (HidD_GetPreparsedData(win_handle, &preparsed))
+        if (get_feature_index(handle, dev_idx, 0x40A0, &feature_index) == 0)
         {
-            if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS &&
-                caps.OutputReportByteLength > 0)
+            // #region agent log
             {
-                report_len = caps.OutputReportByteLength;
+                char buf[96];
+                snprintf(buf, sizeof(buf),
+                    "{\"device_index\":%u,\"feature_index\":%u,\"feature_id\":\"0x40A0\"}",
+                    dev_idx, feature_index);
+                debug_log("K", "main.c:discover", "found_fn_inversion", buf);
             }
-            HidD_FreePreparsedData(preparsed);
+            // #endregion
+            if (set_fn_lock_packet(handle, dev_idx, feature_index, 0x10 | SW_ID, 0x00) == 0)
+                return 0;
         }
-
-        // #region agent log
-        {
-            char logbuf[160];
-            snprintf(logbuf, sizeof(logbuf),
-                "{\"output_report_length\":%u,\"feature_report_length\":%u,\"send_length\":%lu}",
-                caps.OutputReportByteLength, caps.FeatureReportByteLength, report_len);
-            debug_log("J", "main.c:caps", "hid_report_lengths", logbuf);
-        }
-        // #endregion
-
-        ok = HidD_SetOutputReport(win_handle, buf, report_len);
-        gle = GetLastError();
-        // #region agent log
-        {
-            char logbuf[128];
-            snprintf(logbuf, sizeof(logbuf),
-                "{\"ok\":%s,\"win32_error\":%lu,\"report_len\":%lu}",
-                ok ? "true" : "false", gle, report_len);
-            debug_log("H", "main.c:set_output_report", "HidD_SetOutputReport", logbuf);
-        }
-        // #endregion
-        if (ok)
-            any_success = 1;
-
-        CloseHandle(win_handle);
     }
 
-    if (handle != NULL)
-    {
-        hidapi_result = hid_write(handle, K400P_SEQ_FN_LOCK, SEQ_LEN);
-        // #region agent log
-        {
-            const wchar_t *err = hid_error(handle);
-            char err_utf8[256] = "";
-            char logbuf[512];
-            if (err && err[0])
-                wcstombs(err_utf8, err, sizeof(err_utf8) - 1);
-            snprintf(logbuf, sizeof(logbuf),
-                "{\"method\":\"hid_write\",\"write_result\":%d,\"expected\":%d,\"hid_error\":\"%s\"}",
-                hidapi_result, SEQ_LEN, err_utf8);
-            debug_log("D", "main.c:hid_write", "hid_write_result", logbuf);
-        }
-        // #endregion
-        if (hidapi_result == SEQ_LEN)
-            any_success = 1;
-    }
+    feature_index = 0x09;
+    if (set_fn_lock_packet(handle, 0x01, feature_index, 0x10 | SW_ID, 0x00) == 0)
+        return 0;
+    if (set_fn_lock_packet(handle, 0x01, feature_index, 0x10 | SW_ID, 0x01) == 0)
+        return 0;
 
-    return any_success ? 0 : 1;
+    // #region agent log
+    debug_log_hex("L", "main.c:fallback", "legacy_fn_lock_request", LEGACY_FN_LOCK, SEQ_LEN);
+    // #endregion
+    if (send_packet(handle, LEGACY_FN_LOCK, SEQ_LEN, response, sizeof(response)) >= 0)
+        return 0;
+
+    return -1;
 }
 
 int main(void)
@@ -192,13 +203,6 @@ int main(void)
     // #endregion
 
     res = hid_init();
-    // #region agent log
-    {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "{\"hid_init_result\":%d}", res);
-        debug_log("E", "main.c:hid_init", "hid_init_done", buf);
-    }
-    // #endregion
     if (res != 0)
         return 1;
 
@@ -207,49 +211,15 @@ int main(void)
     while (cur_dev)
     {
         device_count++;
-        // #region agent log
-        {
-            char buf[512];
-            snprintf(buf, sizeof(buf),
-                "{\"index\":%d,\"vid\":\"0x%04x\",\"pid\":\"0x%04x\",\"usage\":%d,"
-                "\"usage_page\":%d,\"path\":\"%s\",\"matches_target\":%s}",
-                device_count,
-                cur_dev->vendor_id,
-                cur_dev->product_id,
-                cur_dev->usage,
-                cur_dev->usage_page,
-                cur_dev->path ? cur_dev->path : "",
-                (cur_dev->usage == TARGET_USAGE && cur_dev->usage_page == TARGET_USAGE_PAGE) ? "true" : "false");
-            debug_log("A", "main.c:enumerate", "hid_device_found", buf);
-        }
-        // #endregion
-
         if (cur_dev->usage == TARGET_USAGE && cur_dev->usage_page == TARGET_USAGE_PAGE)
         {
             match_count++;
-            // #region agent log
-            {
-                char buf[256];
-                snprintf(buf, sizeof(buf), "{\"path\":\"%s\",\"match_index\":%d}",
-                    cur_dev->path ? cur_dev->path : "", match_count);
-                debug_log("B", "main.c:match", "target_interface_matched", buf);
-            }
-            // #endregion
-
             handle = hid_open_path(cur_dev->path);
-            // #region agent log
-            {
-                char buf[256];
-                snprintf(buf, sizeof(buf), "{\"open_ok\":%s,\"path\":\"%s\"}",
-                    handle ? "true" : "false",
-                    cur_dev->path ? cur_dev->path : "");
-                debug_log("C", "main.c:open", "hid_open_path_result", buf);
-            }
-            // #endregion
+            if (handle == NULL)
+                break;
 
-            result = send_fn_lock(cur_dev->path, handle);
-            if (handle != NULL)
-                hid_close(handle);
+            result = try_fn_lock(handle);
+            hid_close(handle);
             break;
         }
         cur_dev = cur_dev->next;
