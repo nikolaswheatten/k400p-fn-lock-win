@@ -32,13 +32,6 @@ jobs:
       run: |
         mkdir release
         copy dist\k400p-fn-lock.exe release\
-        copy fn_lock_tool.py release\
-        copy requirements.txt release\
-        copy apply_fn_lock.ps1 release\
-        copy install_autostart.bat release\
-        copy install_autostart.ps1 release\
-        copy verify_autostart.bat release\
-        copy diagnose_fn_lock.ps1 release\
         copy README.md release\
         copy LICENSE release\
         powershell Compress-Archive -Path release\* -DestinationPath k400p-fn-lock-win-${{ github.ref_name }}.zip
