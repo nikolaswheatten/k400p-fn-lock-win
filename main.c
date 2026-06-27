@@ -1,241 +1,181 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include <hidapi.h>
 
 #define HIDPP_PKT_LEN 7
-static const int K400P_VID = 0x46d;
-static const int K400P_PID = 0xc52b;
+#define MAX_PATHS 32
+#define MAX_PATH_LEN 512
+
+static const int LOGITECH_VID = 0x46d;
 static const int TARGET_USAGE = 1;
 static const int TARGET_USAGE_PAGE = 65280;
-static const unsigned char SW_ID = 0x0B;
-static const char *DEBUG_RUN_ID = "post-fix-v3";
 
-static const unsigned char LEGACY_FN_LOCK[] = {0x10, 0x01, 0x09, 0x19, 0x00, 0x00, 0x00};
+static const unsigned char FN_LOCK[] = {0x10, 0x01, 0x09, 0x19, 0x00, 0x00, 0x00};
 
-// #region agent log
-static void debug_log(const char *hypothesisId, const char *location, const char *message, const char *dataJson)
+static const unsigned char DEVICE_INDICES[] = {1, 2, 3, 4, 5, 6, 0xFF};
+static const int DEVICE_INDEX_COUNT = 7;
+
+static int path_seen(const char paths[][MAX_PATH_LEN], int count, const char *path)
 {
-    FILE *f;
-    const char *paths[] = {
-        "debug-033532.log",
-        "..\\debug-033532.log",
-        "d:\\Desk\\k400p-fn-lock-win-main\\debug-033532.log",
-        NULL
-    };
-    long long ts = (long long)time(NULL) * 1000;
     int i;
-
-    for (i = 0; paths[i]; i++)
+    for (i = 0; i < count; i++)
     {
-        f = fopen(paths[i], "a");
-        if (f)
-        {
-            fprintf(f,
-                "{\"sessionId\":\"033532\",\"runId\":\"%s\",\"hypothesisId\":\"%s\","
-                "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n",
-                DEBUG_RUN_ID, hypothesisId, location, message, dataJson ? dataJson : "{}", ts);
-            fclose(f);
-            break;
-        }
+        if (strcmp(paths[i], path) == 0)
+            return 1;
     }
+    return 0;
 }
 
-static void debug_log_hex(const char *hypothesisId, const char *location, const char *message,
-    const unsigned char *buf, int len)
+static void print_hex(const char *label, const unsigned char *buf, int len)
 {
-    char data[512];
-    char hex[256];
-    int i, pos = 0;
-
-    for (i = 0; i < len && pos < (int)sizeof(hex) - 3; i++)
-        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", buf[i]);
-
-    snprintf(data, sizeof(data), "{\"len\":%d,\"hex\":\"%s\"}", len, hex);
-    debug_log(hypothesisId, location, message, data);
+    int i;
+    printf("%s (%d bytes): ", label, len);
+    for (i = 0; i < len; i++)
+        printf("%02x ", buf[i]);
+    printf("\n");
 }
-// #endregion
 
-static int send_packet(hid_device *handle, const unsigned char *packet, int len, unsigned char *response, int response_cap)
+static int hidpp_ack(const unsigned char *response, int len)
 {
-    int res;
+    return len >= 3 && response[2] == 0x8F;
+}
+
+static const char *slot_label(unsigned char device_index)
+{
+    return device_index == 0xFF ? "direct (FF)" : NULL;
+}
+
+static int send_fn_lock(hid_device *handle, unsigned char device_index, int verbose)
+{
+    unsigned char pkt[HIDPP_PKT_LEN];
+    unsigned char response[65];
+    int write_res;
     int read_res;
+    char slot_buf[16];
 
-    res = hid_write(handle, packet, len);
-    if (res != len)
+    memcpy(pkt, FN_LOCK, HIDPP_PKT_LEN);
+    pkt[1] = device_index;
+
+    write_res = hid_write(handle, pkt, HIDPP_PKT_LEN);
+    if (write_res != HIDPP_PKT_LEN)
         return -1;
 
-    memset(response, 0, response_cap);
-    read_res = hid_read_timeout(handle, response, response_cap, 500);
-    return read_res;
-}
-
-static int get_feature_index(hid_device *handle, unsigned char device_index, unsigned short feature_id,
-    unsigned char *feature_index_out)
-{
-    unsigned char pkt[HIDPP_PKT_LEN];
-    unsigned char response[65];
-    int read_res;
-
-    pkt[0] = 0x10;
-    pkt[1] = device_index;
-    pkt[2] = 0x00;
-    pkt[3] = 0x00 | SW_ID;
-    pkt[4] = (unsigned char)((feature_id >> 8) & 0xFF);
-    pkt[5] = (unsigned char)(feature_id & 0xFF);
-    pkt[6] = 0x00;
-
-    // #region agent log
-    debug_log_hex("K", "main.c:get_feature", "get_feature_request", pkt, HIDPP_PKT_LEN);
-    // #endregion
-
-    read_res = send_packet(handle, pkt, HIDPP_PKT_LEN, response, sizeof(response));
-    // #region agent log
-    debug_log_hex("K", "main.c:get_feature", "get_feature_response", response, read_res > 0 ? read_res : 0);
-    // #endregion
-
-    if (read_res >= 6 && response[5] != 0x00)
+    if (verbose)
     {
-        *feature_index_out = response[5];
-        return 0;
+        if (slot_label(device_index))
+            printf("  slot %s:\n", slot_label(device_index));
+        else
+        {
+            snprintf(slot_buf, sizeof(slot_buf), "%u", device_index);
+            printf("  slot %s:\n", slot_buf);
+        }
+        print_hex("  sent", pkt, HIDPP_PKT_LEN);
     }
 
-    return -1;
+    memset(response, 0, sizeof(response));
+    read_res = hid_read_timeout(handle, response, sizeof(response), 500);
+    if (read_res > 0)
+    {
+        if (verbose)
+            print_hex("  reply", response, read_res);
+        return hidpp_ack(response, read_res) ? 0 : 0;
+    }
+
+    if (verbose)
+        printf("  -> no reply (write accepted)\n");
+    return 0;
 }
 
-static int set_fn_lock_packet(hid_device *handle, unsigned char device_index, unsigned char feature_index,
-    unsigned char function_with_swid, unsigned char param)
+static int try_hidpp_path(const char *path, int verbose)
 {
-    unsigned char pkt[HIDPP_PKT_LEN];
-    unsigned char response[65];
-    int read_res;
-
-    pkt[0] = 0x10;
-    pkt[1] = device_index;
-    pkt[2] = feature_index;
-    pkt[3] = function_with_swid;
-    pkt[4] = param;
-    pkt[5] = 0x00;
-    pkt[6] = 0x00;
-
-    // #region agent log
-    debug_log_hex("K", "main.c:set_fn", "set_fn_request", pkt, HIDPP_PKT_LEN);
-    // #endregion
-
-    read_res = send_packet(handle, pkt, HIDPP_PKT_LEN, response, sizeof(response));
-    // #region agent log
-    debug_log_hex("K", "main.c:set_fn", "set_fn_response", response, read_res > 0 ? read_res : 0);
-    // #endregion
-
-    return (read_res >= 0) ? 0 : -1;
-}
-
-static int try_fn_lock(hid_device *handle)
-{
-    unsigned char feature_index = 0;
-    unsigned char device_indices[] = {0x01, 0xFF};
-    unsigned char response[65];
+    hid_device *handle;
+    unsigned char idx;
     int i;
+    int writes_ok = 0;
 
-    for (i = 0; i < 2; i++)
+    printf("HID++ interface: %s\n", path);
+
+    handle = hid_open_path(path);
+    if (handle == NULL)
     {
-        unsigned char dev_idx = device_indices[i];
-
-        if (get_feature_index(handle, dev_idx, 0x40A2, &feature_index) == 0)
-        {
-            // #region agent log
-            {
-                char buf[96];
-                snprintf(buf, sizeof(buf),
-                    "{\"device_index\":%u,\"feature_index\":%u,\"feature_id\":\"0x40A2\"}",
-                    dev_idx, feature_index);
-                debug_log("K", "main.c:discover", "found_new_fn_inversion", buf);
-            }
-            // #endregion
-            if (set_fn_lock_packet(handle, dev_idx, feature_index, 0x10 | SW_ID, 0x00) == 0)
-                return 0;
-        }
-
-        if (get_feature_index(handle, dev_idx, 0x40A0, &feature_index) == 0)
-        {
-            // #region agent log
-            {
-                char buf[96];
-                snprintf(buf, sizeof(buf),
-                    "{\"device_index\":%u,\"feature_index\":%u,\"feature_id\":\"0x40A0\"}",
-                    dev_idx, feature_index);
-                debug_log("K", "main.c:discover", "found_fn_inversion", buf);
-            }
-            // #endregion
-            if (set_fn_lock_packet(handle, dev_idx, feature_index, 0x10 | SW_ID, 0x00) == 0)
-                return 0;
-        }
+        printf("  ERROR: could not open device\n");
+        return 0;
     }
 
-    feature_index = 0x09;
-    if (set_fn_lock_packet(handle, 0x01, feature_index, 0x10 | SW_ID, 0x00) == 0)
-        return 0;
-    if (set_fn_lock_packet(handle, 0x01, feature_index, 0x10 | SW_ID, 0x01) == 0)
-        return 0;
+    for (i = 0; i < DEVICE_INDEX_COUNT; i++)
+    {
+        idx = DEVICE_INDICES[i];
+        if (send_fn_lock(handle, idx, verbose) == 0)
+            writes_ok++;
+    }
 
-    // #region agent log
-    debug_log_hex("L", "main.c:fallback", "legacy_fn_lock_request", LEGACY_FN_LOCK, HIDPP_PKT_LEN);
-    // #endregion
-    if (send_packet(handle, LEGACY_FN_LOCK, HIDPP_PKT_LEN, response, sizeof(response)) >= 0)
-        return 0;
-
-    return -1;
+    hid_close(handle);
+    return writes_ok > 0;
 }
 
 int main(void)
 {
-    int res;
-    int result = 1;
-    int device_count = 0;
-    int match_count = 0;
-    hid_device *handle = NULL;
     struct hid_device_info *devs, *cur_dev;
+    char paths[MAX_PATHS][MAX_PATH_LEN];
+    int path_count = 0;
+    int i;
+    int res;
+    int any_ok = 0;
 
-    // #region agent log
-    debug_log("E", "main.c:main", "program_start", "{}");
-    // #endregion
+    printf("k400p-fn-lock: universal Fn Lock for Logitech K400+\n");
+    printf("(all HID++ receivers, device slots 1-6 and direct FF)\n\n");
 
     res = hid_init();
     if (res != 0)
+    {
+        printf("ERROR: hid_init failed\n");
         return 1;
+    }
 
-    devs = hid_enumerate(K400P_VID, K400P_PID);
-    cur_dev = devs;
-    while (cur_dev)
+    devs = hid_enumerate(LOGITECH_VID, 0);
+    for (cur_dev = devs; cur_dev; cur_dev = cur_dev->next)
     {
-        device_count++;
-        if (cur_dev->usage == TARGET_USAGE && cur_dev->usage_page == TARGET_USAGE_PAGE)
-        {
-            match_count++;
-            handle = hid_open_path(cur_dev->path);
-            if (handle == NULL)
-                break;
-
-            result = try_fn_lock(handle);
-            hid_close(handle);
+        if (cur_dev->usage != TARGET_USAGE || cur_dev->usage_page != TARGET_USAGE_PAGE)
+            continue;
+        if (path_count >= MAX_PATHS)
             break;
-        }
-        cur_dev = cur_dev->next;
-    }
+        if (path_seen(paths, path_count, cur_dev->path))
+            continue;
 
-    // #region agent log
-    {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-            "{\"device_count\":%d,\"match_count\":%d,\"exit_code\":%d}",
-            device_count, match_count, result);
-        debug_log("A", "main.c:exit", "program_finish", buf);
+        strncpy(paths[path_count], cur_dev->path, MAX_PATH_LEN - 1);
+        paths[path_count][MAX_PATH_LEN - 1] = '\0';
+        path_count++;
     }
-    // #endregion
-
     hid_free_enumeration(devs);
+
+    if (path_count == 0)
+    {
+        printf("ERROR: no Logitech HID++ interface found.\n");
+        printf("Plug in the K400+ USB dongle and turn the keyboard on.\n");
+        hid_exit();
+        return 1;
+    }
+
+    printf("Found %d HID++ interface(s).\n\n", path_count);
+
+    for (i = 0; i < path_count; i++)
+    {
+        if (try_hidpp_path(paths[i], 1))
+            any_ok = 1;
+        printf("\n");
+    }
+
+    if (!any_ok)
+    {
+        printf("ERROR: could not send Fn Lock to any interface.\n");
+        hid_exit();
+        return 1;
+    }
+
+    printf("Fn Lock commands sent. Test F2 in Explorer on the K400+ keyboard.\n");
+    printf("Setting lasts until reboot.\n");
+
     hid_exit();
-    return result;
+    return 0;
 }

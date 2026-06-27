@@ -1,0 +1,19 @@
+# Build output
+dist/
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+debug*.log
+*.log
+
+# Local apply/install logs live in %LOCALAPPDATA%\k400p-fn-lock\
