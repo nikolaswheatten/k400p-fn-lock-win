@@ -17,6 +17,7 @@
 #define DEFAULT_WAIT_MINUTES 10
 #define DEFAULT_RETRY_SECONDS 15
 #define DEFAULT_LOGON_DELAY 30
+#define DEFAULT_REAPPLY_MINUTES 15
 
 static const int LOGITECH_VID = 0x46d;
 static const int TARGET_USAGE = 1;
@@ -446,15 +447,16 @@ static int install_autostart(void)
         "$triggerUnlock.Enabled=$true;"
         "$triggerUnlock.StateChange=8;"
         "$triggerUnlock.UserId=$env:USERNAME;"
+        "$triggerRepeat=New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes %d) -RepetitionDuration ([TimeSpan]::MaxValue);"
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew;"
         "$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited;"
-        "Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($triggerLogon,$triggerUnlock) -Settings $settings -Principal $principal -Description 'Apply Logitech K400+ Fn Lock after logon/unlock' -Force | Out-Null;"
+        "Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($triggerLogon,$triggerUnlock,$triggerRepeat) -Settings $settings -Principal $principal -Description 'Apply Logitech K400+ Fn Lock after logon/unlock and periodically (survives sleep/reconnect drops)' -Force | Out-Null;"
         "$task=Get-ScheduledTask -TaskName $TaskName;"
         "if(-not $task){exit 3};"
         "if($task.Actions[0].Execute -ne $ExePath){exit 3};"
         "exit 0"
         "\"",
-        TASK_NAME, ps_escaped, DEFAULT_LOGON_DELAY);
+        TASK_NAME, ps_escaped, DEFAULT_LOGON_DELAY, DEFAULT_REAPPLY_MINUTES);
 
     code = run_command_hidden(ps);
     if (code != 0)
@@ -464,7 +466,7 @@ static int install_autostart(void)
         return 2;
     }
 
-    msgf(g_install_log, 1, "INFO", "Registered scheduled task '%s' (logon delay %ds + session unlock).", TASK_NAME, DEFAULT_LOGON_DELAY);
+    msgf(g_install_log, 1, "INFO", "Registered scheduled task '%s' (logon delay %ds + session unlock + reapply every %d min).", TASK_NAME, DEFAULT_LOGON_DELAY, DEFAULT_REAPPLY_MINUTES);
 
     if (probe_interfaces() != 0)
     {

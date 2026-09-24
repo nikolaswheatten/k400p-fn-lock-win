@@ -26,6 +26,8 @@ Prebuilt releases: https://github.com/nikolaswheatten/k400p-fn-lock-win/releases
 
 Fn Lock is sent to **all Logitech HID++ receivers** and **device slots 1–6 + FF** so it works on different PCs and dongle layouts.
 
+`--install` registers a scheduled task with three triggers: logon, session unlock, and a silent reapply every 15 minutes. The periodic trigger exists because Fn Lock is a volatile setting held by the receiver/keyboard firmware (not read back or verified — it's just resent), and it can drop after sleep/resume or a receiver reconnect that isn't covered by the other two triggers.
+
 Logs: `%LOCALAPPDATA%\k400p-fn-lock\apply.log` and `install.log`
 
 ## Build
