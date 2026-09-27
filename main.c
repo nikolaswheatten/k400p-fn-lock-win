@@ -460,6 +460,44 @@ static int read_text_file(const char *path, char *buf, size_t cap)
     return 0;
 }
 
+/* schtasks.exe /Create /XML rejects UTF-8/ANSI task XML outright ("ERROR:
+   Unable to switch encoding") - it expects the file to actually be UTF-16,
+   matching what Task Scheduler's own export produces. */
+static int write_utf16_file(const char *path, const char *narrow_content)
+{
+    FILE *f;
+    int wlen;
+    wchar_t *wbuf;
+    static const unsigned char bom[2] = {0xFF, 0xFE};
+
+    wlen = MultiByteToWideChar(CP_ACP, 0, narrow_content, -1, NULL, 0);
+    if (wlen <= 0)
+        return -1;
+
+    wbuf = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wbuf)
+        return -1;
+
+    if (MultiByteToWideChar(CP_ACP, 0, narrow_content, -1, wbuf, wlen) <= 0)
+    {
+        free(wbuf);
+        return -1;
+    }
+
+    f = fopen(path, "wb");
+    if (!f)
+    {
+        free(wbuf);
+        return -1;
+    }
+
+    fwrite(bom, 1, sizeof(bom), f);
+    fwrite(wbuf, sizeof(wchar_t), (size_t)(wlen - 1), f);
+    fclose(f);
+    free(wbuf);
+    return 0;
+}
+
 /* Task definitions are written as raw Task Scheduler XML and loaded with
    schtasks.exe /Create /XML instead of composing triggers through the
    ScheduledTasks PowerShell module: mixing a plain New-ScheduledTaskTrigger
@@ -483,7 +521,6 @@ static int install_autostart(void)
     char create_out[2048];
     const char *domain;
     const char *user;
-    FILE *xf;
     int code;
 
     g_install_log = open_log_file("install.log");
@@ -519,7 +556,7 @@ static int install_autostart(void)
     }
 
     snprintf(xml, sizeof(xml),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"
         "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
         "  <RegistrationInfo>\n"
         "    <Description>Apply Logitech K400+ Fn Lock after logon/unlock and periodically (survives sleep/reconnect drops)</Description>\n"
@@ -574,14 +611,11 @@ static int install_autostart(void)
         DEFAULT_LOGON_DELAY, userid_esc, userid_esc, start_boundary, DEFAULT_REAPPLY_MINUTES,
         userid_esc, exe_path_esc);
 
-    xf = fopen(xml_path, "w");
-    if (!xf)
+    if (write_utf16_file(xml_path, xml) != 0)
     {
         msgf(g_install_log, 1, "ERROR", "Could not write task definition file.");
         return 1;
     }
-    fputs(xml, xf);
-    fclose(xf);
 
     snprintf(cmd, sizeof(cmd), "cmd.exe /C schtasks.exe /Create /TN \"%s\" /XML \"%s\" /F > \"%s\" 2>&1",
         TASK_NAME, xml_path, create_log_path);
