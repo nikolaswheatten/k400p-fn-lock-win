@@ -403,12 +403,85 @@ static int run_command_hidden(const char *cmd)
     return exit_code;
 }
 
+static void xml_escape(const char *in, char *out, size_t out_cap)
+{
+    size_t i, j;
+
+    for (i = 0, j = 0; in[i] && j + 6 < out_cap; i++)
+    {
+        switch (in[i])
+        {
+        case '&': memcpy(out + j, "&amp;", 5); j += 5; break;
+        case '<': memcpy(out + j, "&lt;", 4); j += 4; break;
+        case '>': memcpy(out + j, "&gt;", 4); j += 4; break;
+        case '"': memcpy(out + j, "&quot;", 6); j += 6; break;
+        case '\'': memcpy(out + j, "&apos;", 6); j += 6; break;
+        default: out[j++] = in[i];
+        }
+    }
+    out[j] = '\0';
+}
+
+static int local_iso_time(char *buf, size_t cap, int add_minutes)
+{
+    time_t now;
+    struct tm tm_info;
+
+    time(&now);
+    now += (time_t)add_minutes * 60;
+    if (localtime_s(&tm_info, &now) != 0)
+        return -1;
+    if (strftime(buf, cap, "%Y-%m-%dT%H:%M:%S", &tm_info) == 0)
+        return -1;
+    return 0;
+}
+
+static int build_support_path(char *out, size_t out_cap, const char *name)
+{
+    char dir[MAX_PATH_LEN];
+
+    if (ensure_log_dir(dir, sizeof(dir)) != 0)
+        return -1;
+    if (snprintf(out, out_cap, "%s\\%s", dir, name) >= (int)out_cap)
+        return -1;
+    return 0;
+}
+
+static int read_text_file(const char *path, char *buf, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    size_t n;
+
+    if (!f)
+        return -1;
+    n = fread(buf, 1, cap - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+    return 0;
+}
+
+/* Task definitions are written as raw Task Scheduler XML and loaded with
+   schtasks.exe /Create /XML instead of composing triggers through the
+   ScheduledTasks PowerShell module: mixing a plain New-ScheduledTaskTrigger
+   array with the unofficial session-unlock CIM trigger silently dropped one
+   of the three triggers on registration (confirmed in the field - the task
+   ended up with only 2 of 3 triggers despite Register-ScheduledTask
+   reporting success). schtasks either accepts the whole XML or rejects it. */
 static int install_autostart(void)
 {
     char exe_path[MAX_PATH_LEN];
-    char ps[MAX_CMD];
-    char ps_escaped[MAX_PATH_LEN * 2];
-    size_t i, j;
+    char exe_path_esc[MAX_PATH_LEN * 2];
+    char userid_raw[512];
+    char userid_esc[512 * 2];
+    char start_boundary[32];
+    char xml_path[MAX_PATH_LEN];
+    char verify_path[MAX_PATH_LEN];
+    char xml[6144];
+    char cmd[MAX_CMD];
+    char verify_out[8192];
+    const char *domain;
+    const char *user;
+    FILE *xf;
     int code;
 
     g_install_log = open_log_file("install.log");
@@ -419,55 +492,119 @@ static int install_autostart(void)
         msgf(g_install_log, 1, "ERROR", "Could not determine executable path.");
         return 1;
     }
+    xml_escape(exe_path, exe_path_esc, sizeof(exe_path_esc));
 
-    for (i = 0, j = 0; exe_path[i] && j + 2 < sizeof(ps_escaped); i++)
+    domain = getenv("USERDOMAIN");
+    user = getenv("USERNAME");
+    if (domain && domain[0])
+        snprintf(userid_raw, sizeof(userid_raw), "%s\\%s", domain, user ? user : "");
+    else
+        snprintf(userid_raw, sizeof(userid_raw), "%s", user ? user : "");
+    xml_escape(userid_raw, userid_esc, sizeof(userid_esc));
+
+    if (local_iso_time(start_boundary, sizeof(start_boundary), DEFAULT_REAPPLY_MINUTES) != 0)
     {
-        if (exe_path[i] == '\'')
-        {
-            ps_escaped[j++] = '\'';
-            ps_escaped[j++] = '\'';
-        }
-        else
-            ps_escaped[j++] = exe_path[i];
+        msgf(g_install_log, 1, "ERROR", "Could not compute trigger start time.");
+        return 1;
     }
-    ps_escaped[j] = '\0';
 
-    snprintf(ps, sizeof(ps),
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \""
-        "$ErrorActionPreference='Stop';"
-        "$TaskName='%s';"
-        "$ExePath='%s';"
-        "$existing=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue;"
-        "if($existing){Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false};"
-        "$action=New-ScheduledTaskAction -Execute $ExePath -Argument '--apply --wait --quiet';"
-        "$triggerLogon=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
-        "$triggerLogon.Delay='PT%dS';"
-        "$unlockClass=Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace Root/Microsoft/Windows/TaskScheduler;"
-        "$triggerUnlock=New-CimInstance -CimClass $unlockClass -ClientOnly;"
-        "$triggerUnlock.Enabled=$true;"
-        "$triggerUnlock.StateChange=8;"
-        "$triggerUnlock.UserId=$env:USERNAME;"
-        /* First occurrence is offset by the interval itself, not 'now':
-           starting it at registration time made it fire immediately,
-           doubling up with install's own live-test apply run. */
-        "$triggerRepeat=New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(%d) -RepetitionInterval (New-TimeSpan -Minutes %d) -RepetitionDuration ([TimeSpan]::MaxValue);"
-        "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew;"
-        "$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited;"
-        "Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($triggerLogon,$triggerUnlock,$triggerRepeat) -Settings $settings -Principal $principal -Description 'Apply Logitech K400+ Fn Lock after logon/unlock and periodically (survives sleep/reconnect drops)' -Force | Out-Null;"
-        "$task=Get-ScheduledTask -TaskName $TaskName;"
-        "if(-not $task){exit 3};"
-        "if($task.Actions[0].Execute -ne $ExePath){exit 3};"
-        "if(@($task.Triggers).Count -ne 3){exit 5};"
-        "exit 0"
-        "\"",
-        TASK_NAME, ps_escaped, DEFAULT_LOGON_DELAY, DEFAULT_REAPPLY_MINUTES, DEFAULT_REAPPLY_MINUTES);
+    if (build_support_path(xml_path, sizeof(xml_path), "task.xml") != 0 ||
+        build_support_path(verify_path, sizeof(verify_path), "task_verify.xml") != 0)
+    {
+        msgf(g_install_log, 1, "ERROR", "Could not determine support file paths.");
+        return 1;
+    }
 
-    code = run_command_hidden(ps);
+    snprintf(xml, sizeof(xml),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        "  <RegistrationInfo>\r\n"
+        "    <Description>Apply Logitech K400+ Fn Lock after logon/unlock and periodically (survives sleep/reconnect drops)</Description>\r\n"
+        "  </RegistrationInfo>\r\n"
+        "  <Triggers>\r\n"
+        "    <LogonTrigger>\r\n"
+        "      <Enabled>true</Enabled>\r\n"
+        "      <Delay>PT%dS</Delay>\r\n"
+        "      <UserId>%s</UserId>\r\n"
+        "    </LogonTrigger>\r\n"
+        "    <SessionStateChangeTrigger>\r\n"
+        "      <Enabled>true</Enabled>\r\n"
+        "      <StateChange>SessionUnlock</StateChange>\r\n"
+        "      <UserId>%s</UserId>\r\n"
+        "    </SessionStateChangeTrigger>\r\n"
+        "    <TimeTrigger>\r\n"
+        "      <Enabled>true</Enabled>\r\n"
+        "      <StartBoundary>%s</StartBoundary>\r\n"
+        "      <Repetition>\r\n"
+        "        <Interval>PT%dM</Interval>\r\n"
+        "      </Repetition>\r\n"
+        "    </TimeTrigger>\r\n"
+        "  </Triggers>\r\n"
+        "  <Principals>\r\n"
+        "    <Principal id=\"Author\">\r\n"
+        "      <UserId>%s</UserId>\r\n"
+        "      <LogonType>InteractiveToken</LogonType>\r\n"
+        "      <RunLevel>LeastPrivilege</RunLevel>\r\n"
+        "    </Principal>\r\n"
+        "  </Principals>\r\n"
+        "  <Settings>\r\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+        "    <StartWhenAvailable>true</StartWhenAvailable>\r\n"
+        "    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
+        "    <Enabled>true</Enabled>\r\n"
+        "    <Hidden>false</Hidden>\r\n"
+        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
+        "    <WakeToRun>false</WakeToRun>\r\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
+        "    <Priority>7</Priority>\r\n"
+        "  </Settings>\r\n"
+        "  <Actions Context=\"Author\">\r\n"
+        "    <Exec>\r\n"
+        "      <Command>%s</Command>\r\n"
+        "      <Arguments>--apply --wait --quiet</Arguments>\r\n"
+        "    </Exec>\r\n"
+        "  </Actions>\r\n"
+        "</Task>\r\n",
+        DEFAULT_LOGON_DELAY, userid_esc, userid_esc, start_boundary, DEFAULT_REAPPLY_MINUTES,
+        userid_esc, exe_path_esc);
+
+    xf = fopen(xml_path, "w");
+    if (!xf)
+    {
+        msgf(g_install_log, 1, "ERROR", "Could not write task definition file.");
+        return 1;
+    }
+    fputs(xml, xf);
+    fclose(xf);
+
+    snprintf(cmd, sizeof(cmd), "schtasks.exe /Create /TN \"%s\" /XML \"%s\" /F", TASK_NAME, xml_path);
+    code = run_command_hidden(cmd);
     if (code != 0)
     {
-        msgf(g_install_log, 1, "ERROR", "Failed to register scheduled task (exit %d).", code);
+        msgf(g_install_log, 1, "ERROR", "Failed to register scheduled task (schtasks exit %d).", code);
         if (g_install_log) fclose(g_install_log);
         return 2;
+    }
+
+    /* Re-read the task back from the live Task Scheduler database (not the
+       file we just wrote) to confirm all 3 triggers actually took. */
+    snprintf(cmd, sizeof(cmd), "cmd.exe /C schtasks.exe /Query /TN \"%s\" /XML ONE > \"%s\" 2>&1",
+        TASK_NAME, verify_path);
+    run_command_hidden(cmd);
+
+    verify_out[0] = '\0';
+    read_text_file(verify_path, verify_out, sizeof(verify_out));
+
+    if (!strstr(verify_out, "<LogonTrigger>") ||
+        !strstr(verify_out, "<SessionStateChangeTrigger>") ||
+        !strstr(verify_out, "<TimeTrigger>"))
+    {
+        msgf(g_install_log, 1, "ERROR", "Registered task is missing one or more triggers. See task_verify.xml.");
+        if (g_install_log) fclose(g_install_log);
+        return 5;
     }
 
     msgf(g_install_log, 1, "INFO", "Registered scheduled task '%s' (logon delay %ds + session unlock + reapply every %d min).", TASK_NAME, DEFAULT_LOGON_DELAY, DEFAULT_REAPPLY_MINUTES);
@@ -514,24 +651,22 @@ static int install_autostart(void)
 
 static int uninstall_autostart(void)
 {
-    char ps[MAX_CMD];
+    char cmd[MAX_CMD];
     int code;
 
     g_install_log = open_log_file("install.log");
     msgf(g_install_log, 1, "INFO", "Removing scheduled task '%s'...", TASK_NAME);
 
-    snprintf(ps, sizeof(ps),
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \""
-        "$t=Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue;"
-        "if($t){Unregister-ScheduledTask -TaskName '%s' -Confirm:$false;"
-        "Write-Host 'Removed scheduled task.'}else{Write-Host 'Task was not installed.'};"
-        "exit 0"
-        "\"",
-        TASK_NAME, TASK_NAME);
+    snprintf(cmd, sizeof(cmd), "schtasks.exe /Delete /TN \"%s\" /F", TASK_NAME);
+    code = run_command_hidden(cmd);
 
-    code = run_command_hidden(ps);
+    if (code == 0)
+        msgf(g_install_log, 1, "INFO", "Removed scheduled task.");
+    else
+        msgf(g_install_log, 1, "INFO", "Task was not installed.");
+
     if (g_install_log) fclose(g_install_log);
-    return code == 0 ? 0 : 1;
+    return 0;
 }
 
 static void print_help(const char *argv0)

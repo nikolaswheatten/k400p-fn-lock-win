@@ -28,7 +28,9 @@ Fn Lock is sent to **all Logitech HID++ receivers** and **device slots 1–6 + F
 
 `--install` registers a scheduled task with three triggers: logon, session unlock, and a silent reapply every 15 minutes. The periodic trigger exists because Fn Lock is a volatile setting held by the receiver/keyboard firmware (not read back or verified — it's just resent), and it can drop after sleep/resume or a receiver reconnect that isn't covered by the other two triggers.
 
-Logs: `%LOCALAPPDATA%\k400p-fn-lock\apply.log` and `install.log`
+The task is registered by writing a Task Scheduler XML file and loading it with `schtasks.exe` (no PowerShell involved) — composing the same three triggers through the `ScheduledTasks` PowerShell module was found to silently drop the session-unlock trigger on some machines despite reporting success, so `--install` now reads the task back from Task Scheduler afterwards and fails loudly if a trigger is missing.
+
+Logs and support files: `%LOCALAPPDATA%\k400p-fn-lock\apply.log`, `install.log`, `task.xml`, `task_verify.xml`
 
 ## Build
 
