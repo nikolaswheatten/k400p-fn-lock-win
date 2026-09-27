@@ -781,16 +781,23 @@ int main(int argc, char **argv)
     int res;
     int code = 1;
 
-    /* Built as a GUI-subsystem binary (see build.bat / README) so Task
-       Scheduler launching it every 15 minutes doesn't flash a console
-       window - a console-subsystem exe gets one allocated unconditionally
-       whether or not it prints anything. When actually run from a
-       terminal, attach to that terminal's console so output still shows. */
-    if (AttachConsole(ATTACH_PARENT_PROCESS))
+    /* A console-subsystem exe gets a console window allocated whenever it's
+       launched without one, e.g. by Task Scheduler - this flashed on every
+       15-minute run. GUI subsystem was tried and reverted: cmd.exe and
+       PowerShell don't wait for a GUI-subsystem process before returning to
+       the prompt, so interactive runs raced with their own output. Instead,
+       detect whether this console was created just for us (nobody else is
+       attached to it - a shared console from an interactive shell always has
+       the shell's own process attached too) and hide only that case, before
+       it can be seen. */
     {
-        (void)freopen("CONOUT$", "w", stdout);
-        (void)freopen("CONOUT$", "w", stderr);
-        (void)freopen("CONIN$", "r", stdin);
+        DWORD console_pids[2];
+        if (GetConsoleProcessList(console_pids, 2) <= 1)
+        {
+            HWND console_wnd = GetConsoleWindow();
+            if (console_wnd)
+                ShowWindow(console_wnd, SW_HIDE);
+        }
     }
 
     if (parse_options(argc, argv, &opt) != 0)
