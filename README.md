@@ -45,8 +45,10 @@ Output: `dist\k400p-fn-lock.exe` (static CRT, no redistributable needed)
 GCC (MinGW):
 
 ```
-gcc main.c hidapi/windows/hid.c -o dist/k400p-fn-lock.exe -I hidapi/include -I hidapi/windows -lsetupapi -O2
+gcc main.c hidapi/windows/hid.c -o dist/k400p-fn-lock.exe -I hidapi/include -I hidapi/windows -lsetupapi -mwindows -O2
 ```
+
+Built as a GUI-subsystem binary (`-mwindows` / `/SUBSYSTEM:WINDOWS`) even though it's a CLI tool: a console-subsystem exe gets a console window allocated by Windows unconditionally, which flashed on screen every time the scheduled task ran. The binary attaches to the calling terminal's console on startup when there is one, so interactive use (`--diagnose`, `--help`, ...) is unaffected.
 
 ## Inspiration
 

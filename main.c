@@ -781,6 +781,18 @@ int main(int argc, char **argv)
     int res;
     int code = 1;
 
+    /* Built as a GUI-subsystem binary (see build.bat / README) so Task
+       Scheduler launching it every 15 minutes doesn't flash a console
+       window - a console-subsystem exe gets one allocated unconditionally
+       whether or not it prints anything. When actually run from a
+       terminal, attach to that terminal's console so output still shows. */
+    if (AttachConsole(ATTACH_PARENT_PROCESS))
+    {
+        (void)freopen("CONOUT$", "w", stdout);
+        (void)freopen("CONOUT$", "w", stderr);
+        (void)freopen("CONIN$", "r", stdin);
+    }
+
     if (parse_options(argc, argv, &opt) != 0)
     {
         print_help(argv[0]);
