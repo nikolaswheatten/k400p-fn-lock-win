@@ -476,9 +476,11 @@ static int install_autostart(void)
     char start_boundary[32];
     char xml_path[MAX_PATH_LEN];
     char verify_path[MAX_PATH_LEN];
+    char create_log_path[MAX_PATH_LEN];
     char xml[6144];
     char cmd[MAX_CMD];
     char verify_out[8192];
+    char create_out[2048];
     const char *domain;
     const char *user;
     FILE *xf;
@@ -509,65 +511,66 @@ static int install_autostart(void)
     }
 
     if (build_support_path(xml_path, sizeof(xml_path), "task.xml") != 0 ||
-        build_support_path(verify_path, sizeof(verify_path), "task_verify.xml") != 0)
+        build_support_path(verify_path, sizeof(verify_path), "task_verify.xml") != 0 ||
+        build_support_path(create_log_path, sizeof(create_log_path), "task_create.log") != 0)
     {
         msgf(g_install_log, 1, "ERROR", "Could not determine support file paths.");
         return 1;
     }
 
     snprintf(xml, sizeof(xml),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
-        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
-        "  <RegistrationInfo>\r\n"
-        "    <Description>Apply Logitech K400+ Fn Lock after logon/unlock and periodically (survives sleep/reconnect drops)</Description>\r\n"
-        "  </RegistrationInfo>\r\n"
-        "  <Triggers>\r\n"
-        "    <LogonTrigger>\r\n"
-        "      <Enabled>true</Enabled>\r\n"
-        "      <Delay>PT%dS</Delay>\r\n"
-        "      <UserId>%s</UserId>\r\n"
-        "    </LogonTrigger>\r\n"
-        "    <SessionStateChangeTrigger>\r\n"
-        "      <Enabled>true</Enabled>\r\n"
-        "      <StateChange>SessionUnlock</StateChange>\r\n"
-        "      <UserId>%s</UserId>\r\n"
-        "    </SessionStateChangeTrigger>\r\n"
-        "    <TimeTrigger>\r\n"
-        "      <Enabled>true</Enabled>\r\n"
-        "      <StartBoundary>%s</StartBoundary>\r\n"
-        "      <Repetition>\r\n"
-        "        <Interval>PT%dM</Interval>\r\n"
-        "      </Repetition>\r\n"
-        "    </TimeTrigger>\r\n"
-        "  </Triggers>\r\n"
-        "  <Principals>\r\n"
-        "    <Principal id=\"Author\">\r\n"
-        "      <UserId>%s</UserId>\r\n"
-        "      <LogonType>InteractiveToken</LogonType>\r\n"
-        "      <RunLevel>LeastPrivilege</RunLevel>\r\n"
-        "    </Principal>\r\n"
-        "  </Principals>\r\n"
-        "  <Settings>\r\n"
-        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
-        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
-        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
-        "    <StartWhenAvailable>true</StartWhenAvailable>\r\n"
-        "    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
-        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
-        "    <Enabled>true</Enabled>\r\n"
-        "    <Hidden>false</Hidden>\r\n"
-        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
-        "    <WakeToRun>false</WakeToRun>\r\n"
-        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
-        "    <Priority>7</Priority>\r\n"
-        "  </Settings>\r\n"
-        "  <Actions Context=\"Author\">\r\n"
-        "    <Exec>\r\n"
-        "      <Command>%s</Command>\r\n"
-        "      <Arguments>--apply --wait --quiet</Arguments>\r\n"
-        "    </Exec>\r\n"
-        "  </Actions>\r\n"
-        "</Task>\r\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
+        "  <RegistrationInfo>\n"
+        "    <Description>Apply Logitech K400+ Fn Lock after logon/unlock and periodically (survives sleep/reconnect drops)</Description>\n"
+        "  </RegistrationInfo>\n"
+        "  <Triggers>\n"
+        "    <LogonTrigger>\n"
+        "      <Enabled>true</Enabled>\n"
+        "      <Delay>PT%dS</Delay>\n"
+        "      <UserId>%s</UserId>\n"
+        "    </LogonTrigger>\n"
+        "    <SessionStateChangeTrigger>\n"
+        "      <Enabled>true</Enabled>\n"
+        "      <StateChange>SessionUnlock</StateChange>\n"
+        "      <UserId>%s</UserId>\n"
+        "    </SessionStateChangeTrigger>\n"
+        "    <TimeTrigger>\n"
+        "      <Enabled>true</Enabled>\n"
+        "      <StartBoundary>%s</StartBoundary>\n"
+        "      <Repetition>\n"
+        "        <Interval>PT%dM</Interval>\n"
+        "      </Repetition>\n"
+        "    </TimeTrigger>\n"
+        "  </Triggers>\n"
+        "  <Principals>\n"
+        "    <Principal id=\"Author\">\n"
+        "      <UserId>%s</UserId>\n"
+        "      <LogonType>InteractiveToken</LogonType>\n"
+        "      <RunLevel>LeastPrivilege</RunLevel>\n"
+        "    </Principal>\n"
+        "  </Principals>\n"
+        "  <Settings>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <StartWhenAvailable>true</StartWhenAvailable>\n"
+        "    <AllowHardTerminate>true</AllowHardTerminate>\n"
+        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n"
+        "    <Enabled>true</Enabled>\n"
+        "    <Hidden>false</Hidden>\n"
+        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n"
+        "    <WakeToRun>false</WakeToRun>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "    <Priority>7</Priority>\n"
+        "  </Settings>\n"
+        "  <Actions Context=\"Author\">\n"
+        "    <Exec>\n"
+        "      <Command>%s</Command>\n"
+        "      <Arguments>--apply --wait --quiet</Arguments>\n"
+        "    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n",
         DEFAULT_LOGON_DELAY, userid_esc, userid_esc, start_boundary, DEFAULT_REAPPLY_MINUTES,
         userid_esc, exe_path_esc);
 
@@ -580,11 +583,16 @@ static int install_autostart(void)
     fputs(xml, xf);
     fclose(xf);
 
-    snprintf(cmd, sizeof(cmd), "schtasks.exe /Create /TN \"%s\" /XML \"%s\" /F", TASK_NAME, xml_path);
+    snprintf(cmd, sizeof(cmd), "cmd.exe /C schtasks.exe /Create /TN \"%s\" /XML \"%s\" /F > \"%s\" 2>&1",
+        TASK_NAME, xml_path, create_log_path);
     code = run_command_hidden(cmd);
     if (code != 0)
     {
+        create_out[0] = '\0';
+        read_text_file(create_log_path, create_out, sizeof(create_out));
         msgf(g_install_log, 1, "ERROR", "Failed to register scheduled task (schtasks exit %d).", code);
+        if (create_out[0])
+            msgf(g_install_log, 1, "ERROR", "schtasks output: %s", create_out);
         if (g_install_log) fclose(g_install_log);
         return 2;
     }
