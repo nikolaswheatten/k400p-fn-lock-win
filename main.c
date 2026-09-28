@@ -204,11 +204,6 @@ static void print_hex_verbose(const char *label, const unsigned char *buf, int l
     outf("%s", line);
 }
 
-static int hidpp_ack(const unsigned char *response, int len)
-{
-    return len >= 3 && response[2] == 0x8F;
-}
-
 static int collect_hidpp_paths(char paths[][MAX_PATH_LEN], int max_paths)
 {
     struct hid_device_info *devs, *cur_dev;
