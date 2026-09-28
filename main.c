@@ -36,8 +36,9 @@
 #define IDC_ABOUT_ICON 2001
 #define IDC_ABOUT_OK 2002
 #define IDC_LINK_MAIN 2003
-#define IDC_LINK_EXEDIR 2004
-#define IDC_LINK_LOGDIR 2005
+#define IDC_LINK_HOMEPAGE 2004
+#define IDC_LINK_EXEDIR 2005
+#define IDC_LINK_LOGDIR 2006
 #define TOAST_CLASS_NAME "K400pFnLockToastWnd"
 #define TOAST_ID 2
 
@@ -812,34 +813,49 @@ static LRESULT CALLBACK about_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (ctl)
             SendMessageA(ctl, STM_SETICON, (WPARAM)hicon, 0);
 
+        /* Each SysLink below holds only content whose rendered height is
+           predictable (one line, or a short paragraph with generous extra
+           room) - the homepage link used to be the last line of one big
+           paragraph control, and a too-short box height clipped it off
+           entirely (confirmed in the field: title/build/description showed,
+           the trailing link line didn't). Giving each link its own control,
+           matching "Running from"/"Logs" below which always rendered fine,
+           removes the guesswork. */
         snprintf(body, sizeof(body),
             "K400+ Fn Lock\r\nBuild: %s %s\r\n\r\n"
             "Universal Fn Lock for the Logitech K400+ keyboard, kept applied "
             "by this resident background app.\r\n\r\n"
-            "License: MIT\r\nHomepage: <a href=\"%s\">%s</a>",
-            __DATE__, __TIME__, HOMEPAGE_URL, HOMEPAGE_URL);
+            "License: MIT",
+            __DATE__, __TIME__);
         ctl = CreateWindowExA(0, "SysLink", body, WS_CHILD | WS_VISIBLE,
-            60, 12, 370, 110, hwnd, (HMENU)(INT_PTR)IDC_LINK_MAIN, NULL, NULL);
+            60, 12, 380, 130, hwnd, (HMENU)(INT_PTR)IDC_LINK_MAIN, NULL, NULL);
         if (!ctl)
             CreateWindowExA(0, "STATIC", body, WS_CHILD | WS_VISIBLE,
-                60, 12, 370, 110, hwnd, NULL, NULL, NULL);
+                60, 12, 380, 130, hwnd, NULL, NULL, NULL);
+
+        snprintf(line, sizeof(line), "Homepage: <a href=\"%s\">%s</a>", HOMEPAGE_URL, HOMEPAGE_URL);
+        ctl = CreateWindowExA(0, "SysLink", line, WS_CHILD | WS_VISIBLE,
+            16, 150, 430, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_HOMEPAGE, NULL, NULL);
+        if (!ctl)
+            CreateWindowExA(0, "STATIC", line, WS_CHILD | WS_VISIBLE,
+                16, 150, 430, 20, hwnd, NULL, NULL, NULL);
 
         snprintf(line, sizeof(line), "Running from: <a href=\"%s\">%s</a>", g_about_exe_dir, g_about_exe_path);
         ctl = CreateWindowExA(0, "SysLink", line, WS_CHILD | WS_VISIBLE,
-            16, 130, 420, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_EXEDIR, NULL, NULL);
+            16, 174, 430, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_EXEDIR, NULL, NULL);
         if (!ctl)
             CreateWindowExA(0, "STATIC", line, WS_CHILD | WS_VISIBLE,
-                16, 130, 420, 20, hwnd, NULL, NULL, NULL);
+                16, 174, 430, 20, hwnd, NULL, NULL, NULL);
 
         snprintf(line, sizeof(line), "Logs: <a href=\"%s\">%s</a>", g_about_log_dir, g_about_log_dir);
         ctl = CreateWindowExA(0, "SysLink", line, WS_CHILD | WS_VISIBLE,
-            16, 155, 420, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_LOGDIR, NULL, NULL);
+            16, 198, 430, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_LOGDIR, NULL, NULL);
         if (!ctl)
             CreateWindowExA(0, "STATIC", line, WS_CHILD | WS_VISIBLE,
-                16, 155, 420, 20, hwnd, NULL, NULL, NULL);
+                16, 198, 430, 20, hwnd, NULL, NULL, NULL);
 
         CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-            350, 195, 80, 26, hwnd, (HMENU)(INT_PTR)IDC_ABOUT_OK, NULL, NULL);
+            360, 238, 80, 26, hwnd, (HMENU)(INT_PTR)IDC_ABOUT_OK, NULL, NULL);
         return 0;
     }
 
@@ -895,7 +911,7 @@ static void show_about(HWND owner)
 
     hwnd = CreateWindowExA(WS_EX_DLGMODALFRAME, ABOUT_CLASS_NAME, "About K400+ Fn Lock",
         WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 470, 270, NULL, NULL, GetModuleHandleA(NULL), NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 480, 340, NULL, NULL, GetModuleHandleA(NULL), NULL);
     if (hwnd)
     {
         SetForegroundWindow(hwnd);
