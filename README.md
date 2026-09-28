@@ -53,8 +53,11 @@ Output: `dist\k400p-fn-lock.exe` (static CRT, no redistributable needed)
 GCC (MinGW):
 
 ```
-gcc main.c hidapi/windows/hid.c -o dist/k400p-fn-lock.exe -I hidapi/include -I hidapi/windows -lsetupapi -lwtsapi32 -ladvapi32 -O2
+windres app.rc -O coff -o app_res.o
+gcc main.c hidapi/windows/hid.c app_res.o -o dist/k400p-fn-lock.exe -I hidapi/include -I hidapi/windows -lsetupapi -lwtsapi32 -ladvapi32 -O2
 ```
+
+`app.ico` / `app.rc` provide the tray icon (also shown as the exe's own icon in Explorer) as a compiled-in resource — both build paths need the resource compiler step (`rc` for MSVC, `windres` for MinGW) before the main build.
 
 Windows still allocates a console window for this console-subsystem exe whenever it's launched without one (e.g. the one-time logon launch of `--resident`). On startup the binary checks whether it owns its console exclusively (`GetConsoleProcessList`); if so, nobody else could be using it, meaning Windows just created it for this launch, so it's hidden immediately (`ShowWindow(..., SW_HIDE)`) before it can flash. Run from a terminal, the console is shared with that shell and is left alone, so interactive use (`--diagnose`, `--help`, ...) is unaffected.
 

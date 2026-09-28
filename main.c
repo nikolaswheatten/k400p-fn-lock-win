@@ -27,6 +27,9 @@
 #define IDM_REAPPLY 1001
 #define IDM_EXIT 1002
 #define IDM_HIDE_ICON 1003
+#define IDM_ABOUT 1004
+#define IDI_APPICON 101
+#define HOMEPAGE_URL "https://github.com/nikolaswheatten/k400p-fn-lock-win"
 #define TIMER_REAPPLY 1
 
 static const int LOGITECH_VID = 0x46d;
@@ -635,7 +638,7 @@ static void add_tray_icon(HWND hwnd)
     g_tray_nid.uID = TRAY_ID;
     g_tray_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_tray_nid.uCallbackMessage = WM_TRAYICON;
-    g_tray_nid.hIcon = LoadIconA(NULL, (LPCSTR)IDI_APPLICATION);
+    g_tray_nid.hIcon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(IDI_APPICON));
     strncpy(g_tray_nid.szTip, "K400+ Fn Lock", sizeof(g_tray_nid.szTip) - 1);
     g_tray_added = Shell_NotifyIconA(NIM_ADD, &g_tray_nid);
 }
@@ -649,6 +652,32 @@ static void remove_tray_icon(void)
     }
 }
 
+static void show_about(HWND hwnd)
+{
+    char exe_path[MAX_PATH_LEN];
+    char log_dir[MAX_PATH_LEN];
+    char text[1024];
+
+    if (get_exe_path(exe_path, sizeof(exe_path)) != 0)
+        strcpy(exe_path, "(unknown)");
+    if (ensure_log_dir(log_dir, sizeof(log_dir)) != 0)
+        strcpy(log_dir, "(unavailable)");
+
+    snprintf(text, sizeof(text),
+        "K400+ Fn Lock\r\n"
+        "Build: %s %s\r\n\r\n"
+        "Universal Fn Lock for the Logitech K400+ keyboard (all HID++ receivers, "
+        "device slots 1-6 + FF), kept applied by this resident background app "
+        "reacting to logon, session unlock and resume-from-sleep.\r\n\r\n"
+        "License: MIT\r\n"
+        "Homepage: " HOMEPAGE_URL "\r\n\r\n"
+        "Running from: %s\r\n"
+        "Logs: %s",
+        __DATE__, __TIME__, exe_path, log_dir);
+
+    MessageBoxA(hwnd, text, "About K400+ Fn Lock", MB_OK | MB_ICONINFORMATION);
+}
+
 static void show_tray_menu(HWND hwnd)
 {
     POINT pt;
@@ -659,6 +688,7 @@ static void show_tray_menu(HWND hwnd)
     AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(menu, MF_STRING, IDM_HIDE_ICON, "Hide icon (use --show-icon to bring it back)");
     AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_ABOUT, "About");
     AppendMenuA(menu, MF_STRING, IDM_EXIT, "Exit");
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
@@ -722,6 +752,8 @@ static LRESULT CALLBACK resident_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             set_hide_icon_pref(1);
             remove_tray_icon();
         }
+        else if (LOWORD(wp) == IDM_ABOUT)
+            show_about(hwnd);
         else if (LOWORD(wp) == IDM_EXIT)
             DestroyWindow(hwnd);
         return 0;
@@ -759,6 +791,7 @@ static int run_resident(void)
     wc.lpfnWndProc = resident_wndproc;
     wc.hInstance = GetModuleHandleA(NULL);
     wc.lpszClassName = RESIDENT_CLASS_NAME;
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(IDI_APPICON));
     RegisterClassA(&wc);
 
     hwnd = CreateWindowExA(0, RESIDENT_CLASS_NAME, RESIDENT_CLASS_NAME, 0,
