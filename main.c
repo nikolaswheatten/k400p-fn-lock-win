@@ -22,9 +22,11 @@
 #define DEFAULT_RETRY_SECONDS 15
 #define DEFAULT_REAPPLY_MINUTES 15
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_TRAYPREF (WM_APP + 2)
 #define TRAY_ID 1
 #define IDM_REAPPLY 1001
 #define IDM_EXIT 1002
+#define IDM_HIDE_ICON 1003
 #define TIMER_REAPPLY 1
 
 static const int LOGITECH_VID = 0x46d;
@@ -46,6 +48,8 @@ typedef struct
     int quiet;
     int wait;
     int resident;
+    int hide_icon;
+    int show_icon;
     int max_wait_minutes;
     int retry_seconds;
 } Options;
@@ -445,6 +449,39 @@ static int remove_run_key(void)
     return (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) ? 0 : -1;
 }
 
+#define SETTINGS_KEY "Software\\K400pFnLock"
+#define HIDE_ICON_VALUE "HideTrayIcon"
+
+static int get_hide_icon_pref(void)
+{
+    HKEY hkey;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    DWORD type;
+
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, SETTINGS_KEY, 0, KEY_QUERY_VALUE, &hkey) != ERROR_SUCCESS)
+        return 0;
+    if (RegQueryValueExA(hkey, HIDE_ICON_VALUE, NULL, &type, (BYTE *)&value, &size) != ERROR_SUCCESS ||
+        type != REG_DWORD)
+        value = 0;
+    RegCloseKey(hkey);
+    return value != 0;
+}
+
+static int set_hide_icon_pref(int hide)
+{
+    HKEY hkey;
+    DWORD value = hide ? 1 : 0;
+    LONG rc;
+
+    rc = RegCreateKeyExA(HKEY_CURRENT_USER, SETTINGS_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &hkey, NULL);
+    if (rc != ERROR_SUCCESS)
+        return -1;
+    rc = RegSetValueExA(hkey, HIDE_ICON_VALUE, 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
+    RegCloseKey(hkey);
+    return rc == ERROR_SUCCESS ? 0 : -1;
+}
+
 static int spawn_detached(const char *cmd)
 {
     STARTUPINFOA si;
@@ -620,6 +657,8 @@ static void show_tray_menu(HWND hwnd)
     GetCursorPos(&pt);
     AppendMenuA(menu, MF_STRING, IDM_REAPPLY, "Reapply Fn Lock now");
     AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_HIDE_ICON, "Hide icon (use --show-icon to bring it back)");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(menu, MF_STRING, IDM_EXIT, "Exit");
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
@@ -631,7 +670,8 @@ static LRESULT CALLBACK resident_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     switch (msg)
     {
     case WM_CREATE:
-        add_tray_icon(hwnd);
+        if (!get_hide_icon_pref())
+            add_tray_icon(hwnd);
         WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         SetTimer(hwnd, TIMER_REAPPLY, (UINT)DEFAULT_REAPPLY_MINUTES * 60 * 1000, NULL);
         resident_apply("startup");
@@ -657,9 +697,31 @@ static LRESULT CALLBACK resident_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             show_tray_menu(hwnd);
         return 0;
 
+    /* Sent by a second invocation (--hide-icon / --show-icon) to an
+       already-running resident process, so the change takes effect without
+       needing a logoff/logon. */
+    case WM_TRAYPREF:
+        if (wp)
+        {
+            set_hide_icon_pref(1);
+            remove_tray_icon();
+        }
+        else
+        {
+            set_hide_icon_pref(0);
+            if (!g_tray_added)
+                add_tray_icon(hwnd);
+        }
+        return 0;
+
     case WM_COMMAND:
         if (LOWORD(wp) == IDM_REAPPLY)
             resident_apply("manual");
+        else if (LOWORD(wp) == IDM_HIDE_ICON)
+        {
+            set_hide_icon_pref(1);
+            remove_tray_icon();
+        }
         else if (LOWORD(wp) == IDM_EXIT)
             DestroyWindow(hwnd);
         return 0;
@@ -733,6 +795,8 @@ static void print_help(const char *argv0)
     printf("  %s --install           Start a background app at logon (tray icon, no console flash)\n", argv0);
     printf("  %s --uninstall         Remove autostart and stop the background app\n", argv0);
     printf("  %s --resident          (internal) run the background app in this process\n", argv0);
+    printf("  %s --hide-icon         Hide the tray icon (background app keeps running)\n", argv0);
+    printf("  %s --show-icon         Show the tray icon again\n", argv0);
     printf("  %s --help               Show this help\n", argv0);
     printf("\nLogs: %%LOCALAPPDATA%%\\%s\\apply.log, install.log\n", LOG_SUBDIR);
 }
@@ -772,6 +836,10 @@ static int parse_options(int argc, char **argv, Options *opt)
             opt->wait = 1;
         else if (strcmp(argv[i], "--resident") == 0)
             opt->resident = 1;
+        else if (strcmp(argv[i], "--hide-icon") == 0)
+            opt->hide_icon = 1;
+        else if (strcmp(argv[i], "--show-icon") == 0)
+            opt->show_icon = 1;
         else
         {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -779,7 +847,8 @@ static int parse_options(int argc, char **argv, Options *opt)
         }
     }
 
-    if (!opt->help && !opt->apply && !opt->diagnose && !opt->probe && !opt->install && !opt->uninstall && !opt->resident)
+    if (!opt->help && !opt->apply && !opt->diagnose && !opt->probe && !opt->install && !opt->uninstall &&
+        !opt->resident && !opt->hide_icon && !opt->show_icon)
     {
         fprintf(stderr, "No mode selected. Use --help.\n");
         return -1;
@@ -836,6 +905,22 @@ int main(int argc, char **argv)
 
     if (opt.resident)
         return run_resident();
+
+    if (opt.hide_icon || opt.show_icon)
+    {
+        int hide = opt.hide_icon;
+        HWND running = FindWindowA(RESIDENT_CLASS_NAME, NULL);
+
+        set_hide_icon_pref(hide);
+        if (running)
+            PostMessageA(running, WM_TRAYPREF, (WPARAM)hide, 0);
+
+        if (!g_quiet)
+            printf("Tray icon will be %s. %s\n",
+                hide ? "hidden" : "shown",
+                running ? "Applied immediately." : "It will apply the next time the background app starts.");
+        return 0;
+    }
 
     g_apply_log = open_log_file("apply.log");
 

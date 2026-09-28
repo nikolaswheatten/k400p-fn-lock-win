@@ -23,6 +23,8 @@ Prebuilt releases: https://github.com/nikolaswheatten/k400p-fn-lock-win/releases
 | `k400p-fn-lock.exe --probe` | Check if HID++ receiver is present |
 | `k400p-fn-lock.exe --install` | Start the background app now, and at every future logon |
 | `k400p-fn-lock.exe --uninstall` | Remove autostart and stop the background app |
+| `k400p-fn-lock.exe --hide-icon` | Hide the tray icon (background app keeps running) |
+| `k400p-fn-lock.exe --show-icon` | Show the tray icon again |
 
 Fn Lock is sent to **all Logitech HID++ receivers** and **device slots 1–6 + FF** so it works on different PCs and dongle layouts.
 
@@ -33,6 +35,8 @@ Fn Lock is a volatile setting held by the receiver/keyboard firmware — it's no
 `--install` instead adds a registry `Run` entry (`HKCU\...\CurrentVersion\Run`, no admin rights needed) that starts `k400p-fn-lock.exe --resident` once at logon and leaves it running for the session — a small tray icon (right-click for "Reapply now" / "Exit") is the only visible trace. Inside, a hidden message-only window reacts immediately to real OS events — session unlock and resume-from-sleep — instead of guessing on a timer, with a 15-minute timer kept only as a fallback. Because it's one long-lived process instead of a new one every 15 minutes, no window is ever created after the initial (also hidden) logon launch.
 
 `--uninstall` removes the registry entry and signals any running instance to exit. Both commands also clean up the old scheduled task from earlier versions if present.
+
+The tray icon can be turned off (the background app and its Fn Lock reapply logic keep running either way): `--hide-icon` / `--show-icon` persist the choice and apply it immediately to an already-running instance, or right-click the icon itself and choose "Hide icon". There's no tray-menu way back once it's hidden — use `--show-icon`.
 
 Logs: `%LOCALAPPDATA%\k400p-fn-lock\apply.log`, `install.log`
 
