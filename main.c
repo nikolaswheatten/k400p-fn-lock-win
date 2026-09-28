@@ -5,6 +5,8 @@
 #include <time.h>
 
 #include <windows.h>
+#include <shellapi.h>
+#include <wtsapi32.h>
 
 #include <hidapi.h>
 
@@ -13,11 +15,17 @@
 #define MAX_PATH_LEN 512
 #define MAX_CMD 8192
 #define TASK_NAME "K400pFnLock"
+#define RESIDENT_CLASS_NAME "K400pFnLockResidentWnd"
+#define RESIDENT_MUTEX_NAME "K400pFnLockResidentMutex"
 #define LOG_SUBDIR "k400p-fn-lock"
 #define DEFAULT_WAIT_MINUTES 10
 #define DEFAULT_RETRY_SECONDS 15
-#define DEFAULT_LOGON_DELAY 30
 #define DEFAULT_REAPPLY_MINUTES 15
+#define WM_TRAYICON (WM_APP + 1)
+#define TRAY_ID 1
+#define IDM_REAPPLY 1001
+#define IDM_EXIT 1002
+#define TIMER_REAPPLY 1
 
 static const int LOGITECH_VID = 0x46d;
 static const int TARGET_USAGE = 1;
@@ -37,6 +45,7 @@ typedef struct
     int help;
     int quiet;
     int wait;
+    int resident;
     int max_wait_minutes;
     int retry_seconds;
 } Options;
@@ -403,124 +412,74 @@ static int run_command_hidden(const char *cmd)
     return exit_code;
 }
 
-static void xml_escape(const char *in, char *out, size_t out_cap)
+static int set_run_key(const char *command)
 {
-    size_t i, j;
+    HKEY hkey;
+    LONG rc;
 
-    for (i = 0, j = 0; in[i] && j + 6 < out_cap; i++)
-    {
-        switch (in[i])
-        {
-        case '&': memcpy(out + j, "&amp;", 5); j += 5; break;
-        case '<': memcpy(out + j, "&lt;", 4); j += 4; break;
-        case '>': memcpy(out + j, "&gt;", 4); j += 4; break;
-        case '"': memcpy(out + j, "&quot;", 6); j += 6; break;
-        case '\'': memcpy(out + j, "&apos;", 6); j += 6; break;
-        default: out[j++] = in[i];
-        }
-    }
-    out[j] = '\0';
+    rc = RegCreateKeyExA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, NULL, 0, KEY_SET_VALUE, NULL, &hkey, NULL);
+    if (rc != ERROR_SUCCESS)
+        return -1;
+
+    rc = RegSetValueExA(hkey, TASK_NAME, 0, REG_SZ,
+        (const BYTE *)command, (DWORD)strlen(command) + 1);
+    RegCloseKey(hkey);
+    return rc == ERROR_SUCCESS ? 0 : -1;
 }
 
-static int local_iso_time(char *buf, size_t cap, int add_minutes)
+static int remove_run_key(void)
 {
-    time_t now;
-    struct tm tm_info;
+    HKEY hkey;
+    LONG rc;
 
-    time(&now);
-    now += (time_t)add_minutes * 60;
-    if (localtime_s(&tm_info, &now) != 0)
+    rc = RegOpenKeyExA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_SET_VALUE, &hkey);
+    if (rc != ERROR_SUCCESS)
         return -1;
-    if (strftime(buf, cap, "%Y-%m-%dT%H:%M:%S", &tm_info) == 0)
+
+    rc = RegDeleteValueA(hkey, TASK_NAME);
+    RegCloseKey(hkey);
+    return (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) ? 0 : -1;
+}
+
+static int spawn_detached(const char *cmd)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char cmdline[MAX_CMD];
+
+    if (strlen(cmd) + 1 >= sizeof(cmdline))
         return -1;
+    strcpy(cmdline, cmd);
+
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return -1;
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return 0;
 }
 
-static int build_support_path(char *out, size_t out_cap, const char *name)
-{
-    char dir[MAX_PATH_LEN];
-
-    if (ensure_log_dir(dir, sizeof(dir)) != 0)
-        return -1;
-    if (snprintf(out, out_cap, "%s\\%s", dir, name) >= (int)out_cap)
-        return -1;
-    return 0;
-}
-
-static int read_text_file(const char *path, char *buf, size_t cap)
-{
-    FILE *f = fopen(path, "r");
-    size_t n;
-
-    if (!f)
-        return -1;
-    n = fread(buf, 1, cap - 1, f);
-    buf[n] = '\0';
-    fclose(f);
-    return 0;
-}
-
-/* schtasks.exe /Create /XML rejects UTF-8/ANSI task XML outright ("ERROR:
-   Unable to switch encoding") - it expects the file to actually be UTF-16,
-   matching what Task Scheduler's own export produces. */
-static int write_utf16_file(const char *path, const char *narrow_content)
-{
-    FILE *f;
-    int wlen;
-    wchar_t *wbuf;
-    static const unsigned char bom[2] = {0xFF, 0xFE};
-
-    wlen = MultiByteToWideChar(CP_ACP, 0, narrow_content, -1, NULL, 0);
-    if (wlen <= 0)
-        return -1;
-
-    wbuf = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-    if (!wbuf)
-        return -1;
-
-    if (MultiByteToWideChar(CP_ACP, 0, narrow_content, -1, wbuf, wlen) <= 0)
-    {
-        free(wbuf);
-        return -1;
-    }
-
-    f = fopen(path, "wb");
-    if (!f)
-    {
-        free(wbuf);
-        return -1;
-    }
-
-    fwrite(bom, 1, sizeof(bom), f);
-    fwrite(wbuf, sizeof(wchar_t), (size_t)(wlen - 1), f);
-    fclose(f);
-    free(wbuf);
-    return 0;
-}
-
-/* Task definitions are written as raw Task Scheduler XML and loaded with
-   schtasks.exe /Create /XML instead of composing triggers through the
-   ScheduledTasks PowerShell module: mixing a plain New-ScheduledTaskTrigger
-   array with the unofficial session-unlock CIM trigger silently dropped one
-   of the three triggers on registration (confirmed in the field - the task
-   ended up with only 2 of 3 triggers despite Register-ScheduledTask
-   reporting success). schtasks either accepts the whole XML or rejects it. */
+/* Every previous approach here spawned a fresh process on a schedule
+   (Task Scheduler, then schtasks/XML) and fought that process's console
+   window flashing on screen and stealing focus - fatal for a fullscreen
+   game. A resident app removes the recurring spawn entirely: one process
+   started at logon lives for the session and reacts to real OS events
+   (session unlock, resume from sleep) via a hidden message window, with a
+   periodic timer only as a fallback. See run_resident(). */
 static int install_autostart(void)
 {
     char exe_path[MAX_PATH_LEN];
-    char exe_path_esc[MAX_PATH_LEN * 2];
-    char userid_raw[512];
-    char userid_esc[512 * 2];
-    char start_boundary[32];
-    char xml_path[MAX_PATH_LEN];
-    char verify_path[MAX_PATH_LEN];
-    char create_log_path[MAX_PATH_LEN];
-    char xml[6144];
-    char cmd[MAX_CMD];
-    char verify_out[8192];
-    char create_out[2048];
-    const char *domain;
-    const char *user;
+    char command[MAX_PATH_LEN + 32];
+    char cleanup_cmd[MAX_CMD];
     int code;
 
     g_install_log = open_log_file("install.log");
@@ -529,185 +488,236 @@ static int install_autostart(void)
     if (get_exe_path(exe_path, sizeof(exe_path)) != 0)
     {
         msgf(g_install_log, 1, "ERROR", "Could not determine executable path.");
-        return 1;
-    }
-    xml_escape(exe_path, exe_path_esc, sizeof(exe_path_esc));
-
-    domain = getenv("USERDOMAIN");
-    user = getenv("USERNAME");
-    if (domain && domain[0])
-        snprintf(userid_raw, sizeof(userid_raw), "%s\\%s", domain, user ? user : "");
-    else
-        snprintf(userid_raw, sizeof(userid_raw), "%s", user ? user : "");
-    xml_escape(userid_raw, userid_esc, sizeof(userid_esc));
-
-    if (local_iso_time(start_boundary, sizeof(start_boundary), DEFAULT_REAPPLY_MINUTES) != 0)
-    {
-        msgf(g_install_log, 1, "ERROR", "Could not compute trigger start time.");
+        if (g_install_log) fclose(g_install_log);
         return 1;
     }
 
-    if (build_support_path(xml_path, sizeof(xml_path), "task.xml") != 0 ||
-        build_support_path(verify_path, sizeof(verify_path), "task_verify.xml") != 0 ||
-        build_support_path(create_log_path, sizeof(create_log_path), "task_create.log") != 0)
-    {
-        msgf(g_install_log, 1, "ERROR", "Could not determine support file paths.");
-        return 1;
-    }
+    /* Best-effort cleanup of the old Task Scheduler-based autostart from
+       earlier versions; it's fine if there's nothing to remove. */
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "schtasks.exe /Delete /TN \"%s\" /F", TASK_NAME);
+    run_command_hidden(cleanup_cmd);
 
-    snprintf(xml, sizeof(xml),
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"
-        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
-        "  <RegistrationInfo>\n"
-        "    <Description>Apply Logitech K400+ Fn Lock after logon/unlock and periodically (survives sleep/reconnect drops)</Description>\n"
-        "  </RegistrationInfo>\n"
-        "  <Triggers>\n"
-        "    <LogonTrigger>\n"
-        "      <Enabled>true</Enabled>\n"
-        "      <Delay>PT%dS</Delay>\n"
-        "      <UserId>%s</UserId>\n"
-        "    </LogonTrigger>\n"
-        "    <SessionStateChangeTrigger>\n"
-        "      <Enabled>true</Enabled>\n"
-        "      <StateChange>SessionUnlock</StateChange>\n"
-        "      <UserId>%s</UserId>\n"
-        "    </SessionStateChangeTrigger>\n"
-        "    <TimeTrigger>\n"
-        "      <Enabled>true</Enabled>\n"
-        "      <StartBoundary>%s</StartBoundary>\n"
-        "      <Repetition>\n"
-        "        <Interval>PT%dM</Interval>\n"
-        "      </Repetition>\n"
-        "    </TimeTrigger>\n"
-        "  </Triggers>\n"
-        "  <Principals>\n"
-        "    <Principal id=\"Author\">\n"
-        "      <UserId>%s</UserId>\n"
-        "      <LogonType>InteractiveToken</LogonType>\n"
-        "      <RunLevel>LeastPrivilege</RunLevel>\n"
-        "    </Principal>\n"
-        "  </Principals>\n"
-        "  <Settings>\n"
-        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
-        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
-        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
-        "    <StartWhenAvailable>true</StartWhenAvailable>\n"
-        "    <AllowHardTerminate>true</AllowHardTerminate>\n"
-        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n"
-        "    <Enabled>true</Enabled>\n"
-        "    <Hidden>false</Hidden>\n"
-        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n"
-        "    <WakeToRun>false</WakeToRun>\n"
-        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
-        "    <Priority>7</Priority>\n"
-        "  </Settings>\n"
-        "  <Actions Context=\"Author\">\n"
-        "    <Exec>\n"
-        "      <Command>%s</Command>\n"
-        "      <Arguments>--apply --wait --quiet</Arguments>\n"
-        "    </Exec>\n"
-        "  </Actions>\n"
-        "</Task>\n",
-        DEFAULT_LOGON_DELAY, userid_esc, userid_esc, start_boundary, DEFAULT_REAPPLY_MINUTES,
-        userid_esc, exe_path_esc);
-
-    if (write_utf16_file(xml_path, xml) != 0)
+    snprintf(command, sizeof(command), "\"%s\" --resident", exe_path);
+    if (set_run_key(command) != 0)
     {
-        msgf(g_install_log, 1, "ERROR", "Could not write task definition file.");
-        return 1;
-    }
-
-    snprintf(cmd, sizeof(cmd), "cmd.exe /C schtasks.exe /Create /TN \"%s\" /XML \"%s\" /F > \"%s\" 2>&1",
-        TASK_NAME, xml_path, create_log_path);
-    code = run_command_hidden(cmd);
-    if (code != 0)
-    {
-        create_out[0] = '\0';
-        read_text_file(create_log_path, create_out, sizeof(create_out));
-        msgf(g_install_log, 1, "ERROR", "Failed to register scheduled task (schtasks exit %d).", code);
-        if (create_out[0])
-            msgf(g_install_log, 1, "ERROR", "schtasks output: %s", create_out);
+        msgf(g_install_log, 1, "ERROR", "Could not write the autostart registry entry.");
         if (g_install_log) fclose(g_install_log);
         return 2;
     }
-
-    /* Re-read the task back from the live Task Scheduler database (not the
-       file we just wrote) to confirm all 3 triggers actually took. */
-    snprintf(cmd, sizeof(cmd), "cmd.exe /C schtasks.exe /Query /TN \"%s\" /XML ONE > \"%s\" 2>&1",
-        TASK_NAME, verify_path);
-    run_command_hidden(cmd);
-
-    verify_out[0] = '\0';
-    read_text_file(verify_path, verify_out, sizeof(verify_out));
-
-    if (!strstr(verify_out, "<LogonTrigger>") ||
-        !strstr(verify_out, "<SessionStateChangeTrigger>") ||
-        !strstr(verify_out, "<TimeTrigger>"))
-    {
-        msgf(g_install_log, 1, "ERROR", "Registered task is missing one or more triggers. See task_verify.xml.");
-        if (g_install_log) fclose(g_install_log);
-        return 5;
-    }
-
-    msgf(g_install_log, 1, "INFO", "Registered scheduled task '%s' (logon delay %ds + session unlock + reapply every %d min).", TASK_NAME, DEFAULT_LOGON_DELAY, DEFAULT_REAPPLY_MINUTES);
+    msgf(g_install_log, 1, "INFO", "Registered autostart entry: %s", command);
 
     if (probe_interfaces() != 0)
     {
         msgf(g_install_log, 1, "INFO", "Live test skipped: HID++ receiver not detected right now.");
-        msgf(g_install_log, 1, "INFO", "Done. Task '%s' is installed.", TASK_NAME);
-        if (g_install_log) fclose(g_install_log);
-        return 0;
-    }
-
-    msgf(g_install_log, 1, "INFO", "Running live test...");
-    g_apply_log = open_log_file("apply.log");
-    g_quiet = 1;
-    if (hid_init() != 0)
-    {
-        msgf(g_install_log, 1, "ERROR", "hid_init failed during live test.");
-        if (g_install_log) fclose(g_install_log);
-        if (g_apply_log) fclose(g_apply_log);
-        return 4;
-    }
-    code = apply_with_wait(0);
-    hid_exit();
-    g_quiet = 0;
-
-    if (code == 0)
-    {
-        msgf(g_install_log, 1, "OK", "Live test OK: Fn Lock applied.");
-        msgf(g_install_log, 1, "INFO", "Done. Task '%s' is installed and verified.", TASK_NAME);
     }
     else
     {
-        msgf(g_install_log, 1, "ERROR", "Live test FAIL (exit %d). Check apply.log", code);
-        if (g_install_log) fclose(g_install_log);
-        if (g_apply_log) fclose(g_apply_log);
-        return 4;
+        msgf(g_install_log, 1, "INFO", "Running live test...");
+        g_apply_log = open_log_file("apply.log");
+        g_quiet = 1;
+        if (hid_init() == 0)
+        {
+            code = apply_with_wait(0);
+            hid_exit();
+            if (code == 0)
+                msgf(g_install_log, 1, "OK", "Live test OK: Fn Lock applied.");
+            else
+                msgf(g_install_log, 1, "ERROR", "Live test FAIL (exit %d). Check apply.log", code);
+        }
+        else
+        {
+            msgf(g_install_log, 1, "ERROR", "hid_init failed during live test.");
+        }
+        g_quiet = 0;
+        if (g_apply_log) { fclose(g_apply_log); g_apply_log = NULL; }
     }
 
+    if (spawn_detached(command) == 0)
+        msgf(g_install_log, 1, "INFO", "Background app started now (also starts at every future logon).");
+    else
+        msgf(g_install_log, 1, "INFO", "Could not start the background app now; it will start at next logon.");
+
+    msgf(g_install_log, 1, "INFO", "Done.");
     if (g_install_log) fclose(g_install_log);
-    if (g_apply_log) fclose(g_apply_log);
     return 0;
 }
 
 static int uninstall_autostart(void)
 {
-    char cmd[MAX_CMD];
-    int code;
+    char cleanup_cmd[MAX_CMD];
+    HWND running;
 
     g_install_log = open_log_file("install.log");
-    msgf(g_install_log, 1, "INFO", "Removing scheduled task '%s'...", TASK_NAME);
+    msgf(g_install_log, 1, "INFO", "Removing autostart...");
 
-    snprintf(cmd, sizeof(cmd), "schtasks.exe /Delete /TN \"%s\" /F", TASK_NAME);
-    code = run_command_hidden(cmd);
-
-    if (code == 0)
-        msgf(g_install_log, 1, "INFO", "Removed scheduled task.");
+    if (remove_run_key() == 0)
+        msgf(g_install_log, 1, "INFO", "Removed autostart registry entry.");
     else
-        msgf(g_install_log, 1, "INFO", "Task was not installed.");
+        msgf(g_install_log, 1, "INFO", "Autostart registry entry was not present.");
 
+    /* Best-effort cleanup of the old Task Scheduler-based autostart. */
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "schtasks.exe /Delete /TN \"%s\" /F", TASK_NAME);
+    run_command_hidden(cleanup_cmd);
+
+    running = FindWindowA(RESIDENT_CLASS_NAME, NULL);
+    if (running)
+    {
+        PostMessageA(running, WM_CLOSE, 0, 0);
+        msgf(g_install_log, 1, "INFO", "Signalled the running background app to exit.");
+    }
+
+    msgf(g_install_log, 1, "INFO", "Done.");
     if (g_install_log) fclose(g_install_log);
+    return 0;
+}
+
+static void resident_apply(const char *reason)
+{
+    char msg[128];
+
+    snprintf(msg, sizeof(msg), "Reapplying Fn Lock (%s)", reason);
+    log_line(g_apply_log, "INFO", msg);
+
+    if (hid_init() != 0)
+    {
+        log_line(g_apply_log, "ERROR", "hid_init failed");
+        return;
+    }
+    apply_fn_lock_verbose(0);
+    hid_exit();
+}
+
+static NOTIFYICONDATAA g_tray_nid;
+static int g_tray_added = 0;
+
+static void add_tray_icon(HWND hwnd)
+{
+    memset(&g_tray_nid, 0, sizeof(g_tray_nid));
+    g_tray_nid.cbSize = sizeof(g_tray_nid);
+    g_tray_nid.hWnd = hwnd;
+    g_tray_nid.uID = TRAY_ID;
+    g_tray_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_tray_nid.uCallbackMessage = WM_TRAYICON;
+    g_tray_nid.hIcon = LoadIconA(NULL, (LPCSTR)IDI_APPLICATION);
+    strncpy(g_tray_nid.szTip, "K400+ Fn Lock", sizeof(g_tray_nid.szTip) - 1);
+    g_tray_added = Shell_NotifyIconA(NIM_ADD, &g_tray_nid);
+}
+
+static void remove_tray_icon(void)
+{
+    if (g_tray_added)
+    {
+        Shell_NotifyIconA(NIM_DELETE, &g_tray_nid);
+        g_tray_added = 0;
+    }
+}
+
+static void show_tray_menu(HWND hwnd)
+{
+    POINT pt;
+    HMENU menu = CreatePopupMenu();
+
+    GetCursorPos(&pt);
+    AppendMenuA(menu, MF_STRING, IDM_REAPPLY, "Reapply Fn Lock now");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_EXIT, "Exit");
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(menu);
+}
+
+static LRESULT CALLBACK resident_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+        add_tray_icon(hwnd);
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        SetTimer(hwnd, TIMER_REAPPLY, (UINT)DEFAULT_REAPPLY_MINUTES * 60 * 1000, NULL);
+        resident_apply("startup");
+        return 0;
+
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_UNLOCK)
+            resident_apply("session unlock");
+        return 0;
+
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND)
+            resident_apply("resume from sleep");
+        return TRUE;
+
+    case WM_TIMER:
+        if (wp == TIMER_REAPPLY)
+            resident_apply("periodic");
+        return 0;
+
+    case WM_TRAYICON:
+        if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP)
+            show_tray_menu(hwnd);
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDM_REAPPLY)
+            resident_apply("manual");
+        else if (LOWORD(wp) == IDM_EXIT)
+            DestroyWindow(hwnd);
+        return 0;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        WTSUnRegisterSessionNotification(hwnd);
+        KillTimer(hwnd, TIMER_REAPPLY);
+        remove_tray_icon();
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static int run_resident(void)
+{
+    HANDLE mutex;
+    WNDCLASSA wc;
+    HWND hwnd;
+    MSG msg;
+
+    mutex = CreateMutexA(NULL, TRUE, RESIDENT_MUTEX_NAME);
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0; /* another instance is already running */
+
+    g_quiet = 1;
+    g_apply_log = open_log_file("apply.log");
+    log_line(g_apply_log, "INFO", "=== K400+ Fn Lock resident app started ===");
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = resident_wndproc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = RESIDENT_CLASS_NAME;
+    RegisterClassA(&wc);
+
+    hwnd = CreateWindowExA(0, RESIDENT_CLASS_NAME, RESIDENT_CLASS_NAME, 0,
+        0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd)
+    {
+        log_line(g_apply_log, "ERROR", "Could not create message window.");
+        if (g_apply_log) fclose(g_apply_log);
+        CloseHandle(mutex);
+        return 1;
+    }
+
+    while (GetMessageA(&msg, NULL, 0, 0) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    log_line(g_apply_log, "INFO", "=== K400+ Fn Lock resident app stopped ===");
+    if (g_apply_log) fclose(g_apply_log);
+    CloseHandle(mutex);
     return 0;
 }
 
@@ -720,8 +730,9 @@ static void print_help(const char *argv0)
     printf("  %s --apply --wait      Wait for dongle, retry (autostart mode)\n", argv0);
     printf("  %s --diagnose          Apply with verbose output\n", argv0);
     printf("  %s --probe             Exit 0 if HID++ receiver present\n", argv0);
-    printf("  %s --install           Register logon/unlock scheduled task\n", argv0);
-    printf("  %s --uninstall         Remove scheduled task\n", argv0);
+    printf("  %s --install           Start a background app at logon (tray icon, no console flash)\n", argv0);
+    printf("  %s --uninstall         Remove autostart and stop the background app\n", argv0);
+    printf("  %s --resident          (internal) run the background app in this process\n", argv0);
     printf("  %s --help               Show this help\n", argv0);
     printf("\nLogs: %%LOCALAPPDATA%%\\%s\\apply.log, install.log\n", LOG_SUBDIR);
 }
@@ -759,6 +770,8 @@ static int parse_options(int argc, char **argv, Options *opt)
             opt->quiet = 1;
         else if (strcmp(argv[i], "--wait") == 0)
             opt->wait = 1;
+        else if (strcmp(argv[i], "--resident") == 0)
+            opt->resident = 1;
         else
         {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -766,7 +779,7 @@ static int parse_options(int argc, char **argv, Options *opt)
         }
     }
 
-    if (!opt->help && !opt->apply && !opt->diagnose && !opt->probe && !opt->install && !opt->uninstall)
+    if (!opt->help && !opt->apply && !opt->diagnose && !opt->probe && !opt->install && !opt->uninstall && !opt->resident)
     {
         fprintf(stderr, "No mode selected. Use --help.\n");
         return -1;
@@ -814,15 +827,17 @@ int main(int argc, char **argv)
 
     g_quiet = opt.quiet;
 
-    if (!opt.install && !opt.uninstall)
-        g_apply_log = open_log_file("apply.log");
-
     if (opt.install || opt.uninstall)
     {
         if (opt.install)
             return install_autostart();
         return uninstall_autostart();
     }
+
+    if (opt.resident)
+        return run_resident();
+
+    g_apply_log = open_log_file("apply.log");
 
     res = hid_init();
     if (res != 0)
