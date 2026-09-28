@@ -1,3 +1,7 @@
 #define IDI_APPICON 101
 
 IDI_APPICON ICON "app.ico"
+
+/* Needed for SysLink (About box hyperlinks) to bind to ComCtl32 v6 instead
+   of the always-present v5, which predates SysLink and has no such class. */
+1 24 "app.manifest"

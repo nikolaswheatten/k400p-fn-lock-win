@@ -18,7 +18,8 @@ Prebuilt releases: https://github.com/nikolaswheatten/k400p-fn-lock-win/releases
 
 | Command | Description |
 |---------|-------------|
-| `k400p-fn-lock.exe` | Apply Fn Lock quietly |
+| `k400p-fn-lock.exe` | Double-click: reinstall autostart (fresh registry entry + restart the background app) and report the result as a toast |
+| `k400p-fn-lock.exe --apply` | Apply Fn Lock once, quietly, no autostart change |
 | `k400p-fn-lock.exe --diagnose` | Apply with verbose output |
 | `k400p-fn-lock.exe --probe` | Check if HID++ receiver is present |
 | `k400p-fn-lock.exe --install` | Start the background app now, and at every future logon |
@@ -38,6 +39,8 @@ Fn Lock is a volatile setting held by the receiver/keyboard firmware — it's no
 
 The tray icon can be turned off (the background app and its Fn Lock reapply logic keep running either way): `--hide-icon` / `--show-icon` persist the choice and apply it immediately to an already-running instance, or right-click the icon itself and choose "Hide icon". There's no tray-menu way back once it's hidden — use `--show-icon`.
 
+Double-clicking `k400p-fn-lock.exe` with no arguments — the normal thing to do with a downloaded exe, with no console attached to read output from — reinstalls the autostart entry (uninstall then install, so it also picks up replacing the exe in place) and reports the outcome as a Windows toast notification instead of printing anything: e.g. "Autostart installed and Fn Lock applied." or, if something went wrong, an error toast pointing at `install.log`. The tray right-click menu has "About" with the homepage and log folder as clickable links.
+
 Logs: `%LOCALAPPDATA%\k400p-fn-lock\apply.log`, `install.log`
 
 ## Build
@@ -54,10 +57,10 @@ GCC (MinGW):
 
 ```
 windres app.rc -O coff -o app_res.o
-gcc main.c hidapi/windows/hid.c app_res.o -o dist/k400p-fn-lock.exe -I hidapi/include -I hidapi/windows -lsetupapi -lwtsapi32 -ladvapi32 -O2
+gcc main.c hidapi/windows/hid.c app_res.o -o dist/k400p-fn-lock.exe -I hidapi/include -I hidapi/windows -lsetupapi -lwtsapi32 -ladvapi32 -lcomctl32 -O2
 ```
 
-`app.ico` / `app.rc` provide the tray icon (also shown as the exe's own icon in Explorer) as a compiled-in resource — both build paths need the resource compiler step (`rc` for MSVC, `windres` for MinGW) before the main build.
+`app.ico` / `app.rc` provide the tray icon (also shown as the exe's own icon in Explorer) as a compiled-in resource — both build paths need the resource compiler step (`rc` for MSVC, `windres` for MinGW) before the main build. `app.rc` also embeds `app.manifest`, which declares a dependency on ComCtl32 v6 — needed for the About box's SysLink hyperlinks; without it Windows loads the older ComCtl32 v5, which predates that control entirely.
 
 Windows still allocates a console window for this console-subsystem exe whenever it's launched without one (e.g. the one-time logon launch of `--resident`). On startup the binary checks whether it owns its console exclusively (`GetConsoleProcessList`); if so, nobody else could be using it, meaning Windows just created it for this launch, so it's hidden immediately (`ShowWindow(..., SW_HIDE)`) before it can flash. Run from a terminal, the console is shared with that shell and is left alone, so interactive use (`--diagnose`, `--help`, ...) is unaffected.
 
