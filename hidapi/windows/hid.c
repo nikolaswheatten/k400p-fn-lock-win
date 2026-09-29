@@ -824,7 +824,11 @@ HID_API_EXPORT hid_device * HID_API_CALL hid_open_path(const char *path)
 
 	interface_path = hid_internal_UTF8toUTF16(path);
 	if (!interface_path) {
-		register_string_error(dev, L"Path conversion failure");
+		/* dev isn't allocated yet at this point - register_string_error(dev, ...)
+		   would write through a NULL hid_device* (dev->last_error_str). Use the
+		   same global-error path the sibling not-found case above already uses
+		   before a device exists. */
+		register_global_error(L"Path conversion failure");
 		goto end_of_function;
 	}
 

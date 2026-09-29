@@ -6,6 +6,8 @@ dist/
 *.exp
 *.pdb
 *.ilk
+*.res
+app_res.o
 
 # Logs
 debug*.log

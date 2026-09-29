@@ -5,6 +5,9 @@
 #include <time.h>
 
 #include <windows.h>
+#include <shellapi.h>
+#include <wtsapi32.h>
+#include <commctrl.h>
 
 #include <hidapi.h>
 
@@ -13,10 +16,31 @@
 #define MAX_PATH_LEN 512
 #define MAX_CMD 8192
 #define TASK_NAME "K400pFnLock"
+#define RESIDENT_CLASS_NAME "K400pFnLockResidentWnd"
+#define RESIDENT_MUTEX_NAME "K400pFnLockResidentMutex"
 #define LOG_SUBDIR "k400p-fn-lock"
 #define DEFAULT_WAIT_MINUTES 10
 #define DEFAULT_RETRY_SECONDS 15
-#define DEFAULT_LOGON_DELAY 30
+#define DEFAULT_REAPPLY_MINUTES 15
+#define WM_TRAYICON (WM_APP + 1)
+#define WM_TRAYPREF (WM_APP + 2)
+#define TRAY_ID 1
+#define IDM_REAPPLY 1001
+#define IDM_EXIT 1002
+#define IDM_HIDE_ICON 1003
+#define IDM_ABOUT 1004
+#define IDI_APPICON 101
+#define HOMEPAGE_URL "https://github.com/nikolaswheatten/k400p-fn-lock-win"
+#define TIMER_REAPPLY 1
+#define ABOUT_CLASS_NAME "K400pFnLockAboutWnd"
+#define IDC_ABOUT_ICON 2001
+#define IDC_ABOUT_OK 2002
+#define IDC_LINK_MAIN 2003
+#define IDC_LINK_HOMEPAGE 2004
+#define IDC_LINK_EXEDIR 2005
+#define IDC_LINK_LOGDIR 2006
+#define TOAST_CLASS_NAME "K400pFnLockToastWnd"
+#define TOAST_ID 2
 
 static const int LOGITECH_VID = 0x46d;
 static const int TARGET_USAGE = 1;
@@ -36,6 +60,10 @@ typedef struct
     int help;
     int quiet;
     int wait;
+    int resident;
+    int hide_icon;
+    int show_icon;
+    int reinstall;
     int max_wait_minutes;
     int retry_seconds;
 } Options;
@@ -114,8 +142,25 @@ static void msgf(FILE *log, int to_console, const char *level, const char *fmt, 
     va_end(ap);
 
     log_line(log, level, buf);
-    if (to_console)
+    if (to_console && !g_quiet)
         printf("%s\n", buf);
+}
+
+/* Like msgf, but also copies the formatted line into an optional caller
+   buffer - used to hand a human-readable headline to a toast notification
+   without duplicating the message text at the call site. */
+static void note(char *out, size_t out_cap, FILE *log, const char *level, const char *fmt, ...)
+{
+    char buf[300];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    msgf(log, 1, level, "%s", buf);
+    if (out && out_cap)
+        snprintf(out, out_cap, "%s", buf);
 }
 
 static void outf(const char *fmt, ...)
@@ -157,11 +202,6 @@ static void print_hex_verbose(const char *label, const unsigned char *buf, int l
 
     snprintf(line, sizeof(line), "%s (%d bytes): %s", label, len, hex);
     outf("%s", line);
-}
-
-static int hidpp_ack(const unsigned char *response, int len)
-{
-    return len >= 3 && response[2] == 0x8F;
 }
 
 static int collect_hidpp_paths(char paths[][MAX_PATH_LEN], int max_paths)
@@ -402,130 +442,614 @@ static int run_command_hidden(const char *cmd)
     return exit_code;
 }
 
-static int install_autostart(void)
+static int set_run_key(const char *command)
+{
+    HKEY hkey;
+    LONG rc;
+
+    rc = RegCreateKeyExA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, NULL, 0, KEY_SET_VALUE, NULL, &hkey, NULL);
+    if (rc != ERROR_SUCCESS)
+        return -1;
+
+    rc = RegSetValueExA(hkey, TASK_NAME, 0, REG_SZ,
+        (const BYTE *)command, (DWORD)strlen(command) + 1);
+    RegCloseKey(hkey);
+    return rc == ERROR_SUCCESS ? 0 : -1;
+}
+
+static int remove_run_key(void)
+{
+    HKEY hkey;
+    LONG rc;
+
+    rc = RegOpenKeyExA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_SET_VALUE, &hkey);
+    if (rc != ERROR_SUCCESS)
+        return -1;
+
+    rc = RegDeleteValueA(hkey, TASK_NAME);
+    RegCloseKey(hkey);
+    return (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) ? 0 : -1;
+}
+
+#define SETTINGS_KEY "Software\\K400pFnLock"
+#define HIDE_ICON_VALUE "HideTrayIcon"
+
+static int get_hide_icon_pref(void)
+{
+    HKEY hkey;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    DWORD type;
+
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, SETTINGS_KEY, 0, KEY_QUERY_VALUE, &hkey) != ERROR_SUCCESS)
+        return 0;
+    if (RegQueryValueExA(hkey, HIDE_ICON_VALUE, NULL, &type, (BYTE *)&value, &size) != ERROR_SUCCESS ||
+        type != REG_DWORD)
+        value = 0;
+    RegCloseKey(hkey);
+    return value != 0;
+}
+
+static int set_hide_icon_pref(int hide)
+{
+    HKEY hkey;
+    DWORD value = hide ? 1 : 0;
+    LONG rc;
+
+    rc = RegCreateKeyExA(HKEY_CURRENT_USER, SETTINGS_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &hkey, NULL);
+    if (rc != ERROR_SUCCESS)
+        return -1;
+    rc = RegSetValueExA(hkey, HIDE_ICON_VALUE, 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
+    RegCloseKey(hkey);
+    return rc == ERROR_SUCCESS ? 0 : -1;
+}
+
+static int spawn_detached(const char *cmd)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char cmdline[MAX_CMD];
+
+    if (strlen(cmd) + 1 >= sizeof(cmdline))
+        return -1;
+    strcpy(cmdline, cmd);
+
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return -1;
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 0;
+}
+
+/* Every previous approach here spawned a fresh process on a schedule
+   (Task Scheduler, then schtasks/XML) and fought that process's console
+   window flashing on screen and stealing focus - fatal for a fullscreen
+   game. A resident app removes the recurring spawn entirely: one process
+   started at logon lives for the session and reacts to real OS events
+   (session unlock, resume from sleep) via a hidden message window, with a
+   periodic timer only as a fallback. See run_resident(). */
+/* summary/summary_cap receive a single human-readable headline (the
+   outcome that matters to a user, not every intermediate step) for the
+   caller to show as a toast; pass NULL/0 when nothing needs it (the
+   --install log/console output above already has the full detail). */
+static int install_autostart(char *summary, size_t summary_cap)
 {
     char exe_path[MAX_PATH_LEN];
-    char ps[MAX_CMD];
-    char ps_escaped[MAX_PATH_LEN * 2];
-    size_t i, j;
+    char command[MAX_PATH_LEN + 32];
+    char cleanup_cmd[MAX_CMD];
     int code;
+    int prev_quiet;
 
     g_install_log = open_log_file("install.log");
     msgf(g_install_log, 1, "INFO", "=== K400+ Fn Lock autostart setup ===");
 
     if (get_exe_path(exe_path, sizeof(exe_path)) != 0)
     {
-        msgf(g_install_log, 1, "ERROR", "Could not determine executable path.");
+        note(summary, summary_cap, g_install_log, "ERROR", "Could not determine executable path.");
+        if (g_install_log) fclose(g_install_log);
         return 1;
     }
 
-    for (i = 0, j = 0; exe_path[i] && j + 2 < sizeof(ps_escaped); i++)
-    {
-        if (exe_path[i] == '\'')
-        {
-            ps_escaped[j++] = '\'';
-            ps_escaped[j++] = '\'';
-        }
-        else
-            ps_escaped[j++] = exe_path[i];
-    }
-    ps_escaped[j] = '\0';
+    /* Best-effort cleanup of the old Task Scheduler-based autostart from
+       earlier versions; it's fine if there's nothing to remove. */
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "schtasks.exe /Delete /TN \"%s\" /F", TASK_NAME);
+    run_command_hidden(cleanup_cmd);
 
-    snprintf(ps, sizeof(ps),
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \""
-        "$ErrorActionPreference='Stop';"
-        "$TaskName='%s';"
-        "$ExePath='%s';"
-        "$existing=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue;"
-        "if($existing){Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false};"
-        "$action=New-ScheduledTaskAction -Execute $ExePath -Argument '--apply --wait --quiet';"
-        "$triggerLogon=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
-        "$triggerLogon.Delay='PT%dS';"
-        "$unlockClass=Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace Root/Microsoft/Windows/TaskScheduler;"
-        "$triggerUnlock=New-CimInstance -CimClass $unlockClass -ClientOnly;"
-        "$triggerUnlock.Enabled=$true;"
-        "$triggerUnlock.StateChange=8;"
-        "$triggerUnlock.UserId=$env:USERNAME;"
-        "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew;"
-        "$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited;"
-        "Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($triggerLogon,$triggerUnlock) -Settings $settings -Principal $principal -Description 'Apply Logitech K400+ Fn Lock after logon/unlock' -Force | Out-Null;"
-        "$task=Get-ScheduledTask -TaskName $TaskName;"
-        "if(-not $task){exit 3};"
-        "if($task.Actions[0].Execute -ne $ExePath){exit 3};"
-        "exit 0"
-        "\"",
-        TASK_NAME, ps_escaped, DEFAULT_LOGON_DELAY);
-
-    code = run_command_hidden(ps);
-    if (code != 0)
+    snprintf(command, sizeof(command), "\"%s\" --resident", exe_path);
+    if (set_run_key(command) != 0)
     {
-        msgf(g_install_log, 1, "ERROR", "Failed to register scheduled task (exit %d).", code);
+        note(summary, summary_cap, g_install_log, "ERROR", "Could not write the autostart registry entry.");
         if (g_install_log) fclose(g_install_log);
         return 2;
     }
-
-    msgf(g_install_log, 1, "INFO", "Registered scheduled task '%s' (logon delay %ds + session unlock).", TASK_NAME, DEFAULT_LOGON_DELAY);
+    msgf(g_install_log, 1, "INFO", "Registered autostart entry: %s", command);
 
     if (probe_interfaces() != 0)
     {
-        msgf(g_install_log, 1, "INFO", "Live test skipped: HID++ receiver not detected right now.");
-        msgf(g_install_log, 1, "INFO", "Done. Task '%s' is installed.", TASK_NAME);
-        if (g_install_log) fclose(g_install_log);
-        return 0;
-    }
-
-    msgf(g_install_log, 1, "INFO", "Running live test...");
-    g_apply_log = open_log_file("apply.log");
-    g_quiet = 1;
-    if (hid_init() != 0)
-    {
-        msgf(g_install_log, 1, "ERROR", "hid_init failed during live test.");
-        if (g_install_log) fclose(g_install_log);
-        if (g_apply_log) fclose(g_apply_log);
-        return 4;
-    }
-    code = apply_with_wait(0);
-    hid_exit();
-    g_quiet = 0;
-
-    if (code == 0)
-    {
-        msgf(g_install_log, 1, "OK", "Live test OK: Fn Lock applied.");
-        msgf(g_install_log, 1, "INFO", "Done. Task '%s' is installed and verified.", TASK_NAME);
+        note(summary, summary_cap, g_install_log, "INFO",
+            "Autostart installed. Plug in the receiver to apply Fn Lock.");
     }
     else
     {
-        msgf(g_install_log, 1, "ERROR", "Live test FAIL (exit %d). Check apply.log", code);
-        if (g_install_log) fclose(g_install_log);
-        if (g_apply_log) fclose(g_apply_log);
-        return 4;
+        msgf(g_install_log, 1, "INFO", "Running live test...");
+        g_apply_log = open_log_file("apply.log");
+        prev_quiet = g_quiet;
+        g_quiet = 1;
+        if (hid_init() == 0)
+        {
+            code = apply_with_wait(0);
+            hid_exit();
+            if (code == 0)
+                note(summary, summary_cap, g_install_log, "OK", "Autostart installed and Fn Lock applied.");
+            else
+                note(summary, summary_cap, g_install_log, "ERROR",
+                    "Autostart installed, but Fn Lock could not be applied yet (exit %d). Check apply.log.", code);
+        }
+        else
+        {
+            note(summary, summary_cap, g_install_log, "ERROR", "hid_init failed during live test.");
+        }
+        g_quiet = prev_quiet;
+        if (g_apply_log) { fclose(g_apply_log); g_apply_log = NULL; }
     }
 
+    if (spawn_detached(command) == 0)
+        msgf(g_install_log, 1, "INFO", "Background app started now (also starts at every future logon).");
+    else
+        msgf(g_install_log, 1, "INFO", "Could not start the background app now; it will start at next logon.");
+
+    msgf(g_install_log, 1, "INFO", "Done.");
     if (g_install_log) fclose(g_install_log);
-    if (g_apply_log) fclose(g_apply_log);
     return 0;
+}
+
+/* install_autostart() spawns a new resident right after this returns; if the
+   old one hasn't actually released RESIDENT_MUTEX_NAME yet, the new one sees
+   ERROR_ALREADY_EXISTS and quietly exits, leaving nothing running. Waiting
+   for the window to close (not just posting WM_CLOSE) closes that race -
+   this is only exercised now that --install/--uninstall can run back to
+   back in the same process (the double-click reinstall flow), not when a
+   person runs them separately with a human-scale gap in between. */
+static void wait_for_old_resident_exit(int timeout_ms)
+{
+    int waited;
+
+    for (waited = 0; waited < timeout_ms; waited += 100)
+    {
+        HANDLE h = OpenMutexA(SYNCHRONIZE, FALSE, RESIDENT_MUTEX_NAME);
+        if (!h)
+            return;
+        CloseHandle(h);
+        Sleep(100);
+    }
 }
 
 static int uninstall_autostart(void)
 {
-    char ps[MAX_CMD];
-    int code;
+    char cleanup_cmd[MAX_CMD];
+    HWND running;
 
     g_install_log = open_log_file("install.log");
-    msgf(g_install_log, 1, "INFO", "Removing scheduled task '%s'...", TASK_NAME);
+    msgf(g_install_log, 1, "INFO", "Removing autostart...");
 
-    snprintf(ps, sizeof(ps),
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \""
-        "$t=Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue;"
-        "if($t){Unregister-ScheduledTask -TaskName '%s' -Confirm:$false;"
-        "Write-Host 'Removed scheduled task.'}else{Write-Host 'Task was not installed.'};"
-        "exit 0"
-        "\"",
-        TASK_NAME, TASK_NAME);
+    if (remove_run_key() == 0)
+        msgf(g_install_log, 1, "INFO", "Removed autostart registry entry.");
+    else
+        msgf(g_install_log, 1, "INFO", "Autostart registry entry was not present.");
 
-    code = run_command_hidden(ps);
+    /* Best-effort cleanup of the old Task Scheduler-based autostart. */
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "schtasks.exe /Delete /TN \"%s\" /F", TASK_NAME);
+    run_command_hidden(cleanup_cmd);
+
+    running = FindWindowA(RESIDENT_CLASS_NAME, NULL);
+    if (running)
+    {
+        PostMessageA(running, WM_CLOSE, 0, 0);
+        msgf(g_install_log, 1, "INFO", "Signalling the running background app to exit...");
+        wait_for_old_resident_exit(3000);
+    }
+
+    msgf(g_install_log, 1, "INFO", "Done.");
     if (g_install_log) fclose(g_install_log);
-    return code == 0 ? 0 : 1;
+    return 0;
+}
+
+/* A one-shot balloon/toast shown from a throwaway tray icon: Shell_NotifyIcon
+   with NIIF_INFO/NIIF_ERROR is the legacy "balloon tip" API, but modern
+   Windows renders it as a native Action Center toast regardless - no need
+   for the heavier WinRT toast APIs for a single status line. The icon is
+   only needed long enough for the shell to pick up the notification; the
+   toast itself persists in Action Center after it's removed. */
+static void notify_toast(const char *title, const char *message, int is_error)
+{
+    WNDCLASSA wc;
+    HWND hwnd;
+    NOTIFYICONDATAA nid;
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = TOAST_CLASS_NAME;
+    RegisterClassA(&wc);
+
+    hwnd = CreateWindowExA(0, TOAST_CLASS_NAME, TOAST_CLASS_NAME, 0,
+        0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd)
+        return;
+
+    memset(&nid, 0, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = TOAST_ID;
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
+    nid.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(IDI_APPICON));
+    snprintf(nid.szTip, sizeof(nid.szTip), "%s", "K400+ Fn Lock");
+    snprintf(nid.szInfoTitle, sizeof(nid.szInfoTitle), "%s", title);
+    snprintf(nid.szInfo, sizeof(nid.szInfo), "%s", message);
+    nid.dwInfoFlags = is_error ? NIIF_ERROR : NIIF_INFO;
+    nid.uTimeout = 10000;
+
+    Shell_NotifyIconA(NIM_ADD, &nid);
+    Sleep(300);
+    Shell_NotifyIconA(NIM_DELETE, &nid);
+    DestroyWindow(hwnd);
+}
+
+/* The default action for a bare double-click: no console, no CLI to read -
+   reinstall the autostart entry (also picks up an exe update in place) and
+   report the outcome as a toast instead of the terminal output this used
+   to be. */
+static void reinstall_and_notify(void)
+{
+    char summary[300];
+    int code;
+
+    g_quiet = 1;
+    uninstall_autostart();
+
+    summary[0] = '\0';
+    code = install_autostart(summary, sizeof(summary));
+    if (!summary[0])
+        snprintf(summary, sizeof(summary), code == 0 ? "Done." : "Install failed (exit %d). Check install.log.", code);
+
+    notify_toast(code == 0 ? "K400+ Fn Lock" : "K400+ Fn Lock - problem", summary, code != 0);
+}
+
+static void resident_apply(const char *reason)
+{
+    char msg[128];
+
+    snprintf(msg, sizeof(msg), "Reapplying Fn Lock (%s)", reason);
+    log_line(g_apply_log, "INFO", msg);
+
+    if (hid_init() != 0)
+    {
+        log_line(g_apply_log, "ERROR", "hid_init failed");
+        return;
+    }
+    apply_fn_lock_verbose(0);
+    hid_exit();
+}
+
+static NOTIFYICONDATAA g_tray_nid;
+static int g_tray_added = 0;
+
+static void add_tray_icon(HWND hwnd)
+{
+    memset(&g_tray_nid, 0, sizeof(g_tray_nid));
+    g_tray_nid.cbSize = sizeof(g_tray_nid);
+    g_tray_nid.hWnd = hwnd;
+    g_tray_nid.uID = TRAY_ID;
+    g_tray_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_tray_nid.uCallbackMessage = WM_TRAYICON;
+    g_tray_nid.hIcon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(IDI_APPICON));
+    strncpy(g_tray_nid.szTip, "K400+ Fn Lock", sizeof(g_tray_nid.szTip) - 1);
+    g_tray_added = Shell_NotifyIconA(NIM_ADD, &g_tray_nid);
+}
+
+static void remove_tray_icon(void)
+{
+    if (g_tray_added)
+    {
+        Shell_NotifyIconA(NIM_DELETE, &g_tray_nid);
+        g_tray_added = 0;
+    }
+}
+
+static char g_about_exe_path[MAX_PATH_LEN];
+static char g_about_exe_dir[MAX_PATH_LEN];
+static char g_about_log_dir[MAX_PATH_LEN];
+
+static void dirname_of(const char *path, char *out, size_t cap)
+{
+    const char *slash = strrchr(path, '\\');
+    size_t len = slash ? (size_t)(slash - path) : 0;
+
+    if (len >= cap)
+        len = cap - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+}
+
+/* SysLink hands back its href in a wide string (LITEM.szUrl) regardless of
+   whether the app is built ANSI or Unicode - convert before handing it to
+   the ANSI ShellExecute. */
+static void open_link(HWND hwnd, const WCHAR *wurl)
+{
+    char url[512];
+
+    WideCharToMultiByte(CP_ACP, 0, wurl, -1, url, sizeof(url), NULL, NULL);
+    ShellExecuteA(hwnd, "open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static LRESULT CALLBACK about_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        char body[700];
+        char line[600];
+        HICON hicon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(IDI_APPICON));
+        HWND ctl;
+
+        ctl = CreateWindowExA(0, "STATIC", NULL, WS_CHILD | WS_VISIBLE | SS_ICON,
+            16, 16, 32, 32, hwnd, (HMENU)(INT_PTR)IDC_ABOUT_ICON, NULL, NULL);
+        if (ctl)
+            SendMessageA(ctl, STM_SETICON, (WPARAM)hicon, 0);
+
+        /* Each SysLink below holds only content whose rendered height is
+           predictable (one line, or a short paragraph with generous extra
+           room) - the homepage link used to be the last line of one big
+           paragraph control, and a too-short box height clipped it off
+           entirely (confirmed in the field: title/build/description showed,
+           the trailing link line didn't). Giving each link its own control,
+           matching "Running from"/"Logs" below which always rendered fine,
+           removes the guesswork. */
+        snprintf(body, sizeof(body),
+            "K400+ Fn Lock\r\nBuild: %s %s\r\n\r\n"
+            "Universal Fn Lock for the Logitech K400+ keyboard, kept applied "
+            "by this resident background app.\r\n\r\n"
+            "License: MIT",
+            __DATE__, __TIME__);
+        ctl = CreateWindowExA(0, "SysLink", body, WS_CHILD | WS_VISIBLE,
+            60, 12, 380, 130, hwnd, (HMENU)(INT_PTR)IDC_LINK_MAIN, NULL, NULL);
+        if (!ctl)
+            CreateWindowExA(0, "STATIC", body, WS_CHILD | WS_VISIBLE,
+                60, 12, 380, 130, hwnd, NULL, NULL, NULL);
+
+        snprintf(line, sizeof(line), "Homepage: <a href=\"%s\">%s</a>", HOMEPAGE_URL, HOMEPAGE_URL);
+        ctl = CreateWindowExA(0, "SysLink", line, WS_CHILD | WS_VISIBLE,
+            16, 150, 430, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_HOMEPAGE, NULL, NULL);
+        if (!ctl)
+            CreateWindowExA(0, "STATIC", line, WS_CHILD | WS_VISIBLE,
+                16, 150, 430, 20, hwnd, NULL, NULL, NULL);
+
+        snprintf(line, sizeof(line), "Running from: <a href=\"%s\">%s</a>", g_about_exe_dir, g_about_exe_path);
+        ctl = CreateWindowExA(0, "SysLink", line, WS_CHILD | WS_VISIBLE,
+            16, 174, 430, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_EXEDIR, NULL, NULL);
+        if (!ctl)
+            CreateWindowExA(0, "STATIC", line, WS_CHILD | WS_VISIBLE,
+                16, 174, 430, 20, hwnd, NULL, NULL, NULL);
+
+        snprintf(line, sizeof(line), "Logs: <a href=\"%s\">%s</a>", g_about_log_dir, g_about_log_dir);
+        ctl = CreateWindowExA(0, "SysLink", line, WS_CHILD | WS_VISIBLE,
+            16, 198, 430, 20, hwnd, (HMENU)(INT_PTR)IDC_LINK_LOGDIR, NULL, NULL);
+        if (!ctl)
+            CreateWindowExA(0, "STATIC", line, WS_CHILD | WS_VISIBLE,
+                16, 198, 430, 20, hwnd, NULL, NULL, NULL);
+
+        CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            360, 238, 80, 26, hwnd, (HMENU)(INT_PTR)IDC_ABOUT_OK, NULL, NULL);
+        return 0;
+    }
+
+    case WM_NOTIFY:
+    {
+        NMHDR *hdr = (NMHDR *)lp;
+        if (hdr->code == NM_CLICK || hdr->code == NM_RETURN)
+            open_link(hwnd, ((PNMLINK)lp)->item.szUrl);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_ABOUT_OK)
+            DestroyWindow(hwnd);
+        return 0;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void show_about(HWND owner)
+{
+    static int registered = 0;
+    INITCOMMONCONTROLSEX icc;
+    WNDCLASSA wc;
+    HWND hwnd;
+
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_LINK_CLASS;
+    InitCommonControlsEx(&icc);
+
+    if (get_exe_path(g_about_exe_path, sizeof(g_about_exe_path)) != 0)
+        strcpy(g_about_exe_path, "(unknown)");
+    dirname_of(g_about_exe_path, g_about_exe_dir, sizeof(g_about_exe_dir));
+    if (ensure_log_dir(g_about_log_dir, sizeof(g_about_log_dir)) != 0)
+        strcpy(g_about_log_dir, "(unavailable)");
+
+    if (!registered)
+    {
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = about_wndproc;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = ABOUT_CLASS_NAME;
+        wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(IDI_APPICON));
+        wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        RegisterClassA(&wc);
+        registered = 1;
+    }
+
+    hwnd = CreateWindowExA(WS_EX_DLGMODALFRAME, ABOUT_CLASS_NAME, "About K400+ Fn Lock",
+        WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 480, 340, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    if (hwnd)
+    {
+        SetForegroundWindow(hwnd);
+    }
+    (void)owner;
+}
+
+static void show_tray_menu(HWND hwnd)
+{
+    POINT pt;
+    HMENU menu = CreatePopupMenu();
+
+    GetCursorPos(&pt);
+    AppendMenuA(menu, MF_STRING, IDM_REAPPLY, "Reapply Fn Lock now");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_HIDE_ICON, "Hide icon (use --show-icon to bring it back)");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_ABOUT, "About");
+    AppendMenuA(menu, MF_STRING, IDM_EXIT, "Exit");
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(menu);
+}
+
+static LRESULT CALLBACK resident_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+        if (!get_hide_icon_pref())
+            add_tray_icon(hwnd);
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        SetTimer(hwnd, TIMER_REAPPLY, (UINT)DEFAULT_REAPPLY_MINUTES * 60 * 1000, NULL);
+        resident_apply("startup");
+        return 0;
+
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_UNLOCK)
+            resident_apply("session unlock");
+        return 0;
+
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND)
+            resident_apply("resume from sleep");
+        return TRUE;
+
+    case WM_TIMER:
+        if (wp == TIMER_REAPPLY)
+            resident_apply("periodic");
+        return 0;
+
+    case WM_TRAYICON:
+        if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP)
+            show_tray_menu(hwnd);
+        return 0;
+
+    /* Sent by a second invocation (--hide-icon / --show-icon) to an
+       already-running resident process, so the change takes effect without
+       needing a logoff/logon. */
+    case WM_TRAYPREF:
+        if (wp)
+        {
+            set_hide_icon_pref(1);
+            remove_tray_icon();
+        }
+        else
+        {
+            set_hide_icon_pref(0);
+            if (!g_tray_added)
+                add_tray_icon(hwnd);
+        }
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDM_REAPPLY)
+            resident_apply("manual");
+        else if (LOWORD(wp) == IDM_HIDE_ICON)
+        {
+            set_hide_icon_pref(1);
+            remove_tray_icon();
+        }
+        else if (LOWORD(wp) == IDM_ABOUT)
+            show_about(hwnd);
+        else if (LOWORD(wp) == IDM_EXIT)
+            DestroyWindow(hwnd);
+        return 0;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        WTSUnRegisterSessionNotification(hwnd);
+        KillTimer(hwnd, TIMER_REAPPLY);
+        remove_tray_icon();
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static int run_resident(void)
+{
+    HANDLE mutex;
+    WNDCLASSA wc;
+    HWND hwnd;
+    MSG msg;
+
+    mutex = CreateMutexA(NULL, TRUE, RESIDENT_MUTEX_NAME);
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0; /* another instance is already running */
+
+    g_quiet = 1;
+    g_apply_log = open_log_file("apply.log");
+    log_line(g_apply_log, "INFO", "=== K400+ Fn Lock resident app started ===");
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = resident_wndproc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = RESIDENT_CLASS_NAME;
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(IDI_APPICON));
+    RegisterClassA(&wc);
+
+    hwnd = CreateWindowExA(0, RESIDENT_CLASS_NAME, RESIDENT_CLASS_NAME, 0,
+        0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd)
+    {
+        log_line(g_apply_log, "ERROR", "Could not create message window.");
+        if (g_apply_log) fclose(g_apply_log);
+        CloseHandle(mutex);
+        return 1;
+    }
+
+    while (GetMessageA(&msg, NULL, 0, 0) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    log_line(g_apply_log, "INFO", "=== K400+ Fn Lock resident app stopped ===");
+    if (g_apply_log) fclose(g_apply_log);
+    CloseHandle(mutex);
+    return 0;
 }
 
 static void print_help(const char *argv0)
@@ -537,8 +1061,11 @@ static void print_help(const char *argv0)
     printf("  %s --apply --wait      Wait for dongle, retry (autostart mode)\n", argv0);
     printf("  %s --diagnose          Apply with verbose output\n", argv0);
     printf("  %s --probe             Exit 0 if HID++ receiver present\n", argv0);
-    printf("  %s --install           Register logon/unlock scheduled task\n", argv0);
-    printf("  %s --uninstall         Remove scheduled task\n", argv0);
+    printf("  %s --install           Start a background app at logon (tray icon, no console flash)\n", argv0);
+    printf("  %s --uninstall         Remove autostart and stop the background app\n", argv0);
+    printf("  %s --resident          (internal) run the background app in this process\n", argv0);
+    printf("  %s --hide-icon         Hide the tray icon (background app keeps running)\n", argv0);
+    printf("  %s --show-icon         Show the tray icon again\n", argv0);
     printf("  %s --help               Show this help\n", argv0);
     printf("\nLogs: %%LOCALAPPDATA%%\\%s\\apply.log, install.log\n", LOG_SUBDIR);
 }
@@ -553,8 +1080,10 @@ static int parse_options(int argc, char **argv, Options *opt)
 
     if (argc <= 1)
     {
-        opt->apply = 1;
-        opt->quiet = 1;
+        /* Bare double-click: no console to read output from, so this
+           reinstalls the autostart entry (also refreshing it after an exe
+           update) and reports the outcome as a toast instead. */
+        opt->reinstall = 1;
         return 0;
     }
 
@@ -576,6 +1105,12 @@ static int parse_options(int argc, char **argv, Options *opt)
             opt->quiet = 1;
         else if (strcmp(argv[i], "--wait") == 0)
             opt->wait = 1;
+        else if (strcmp(argv[i], "--resident") == 0)
+            opt->resident = 1;
+        else if (strcmp(argv[i], "--hide-icon") == 0)
+            opt->hide_icon = 1;
+        else if (strcmp(argv[i], "--show-icon") == 0)
+            opt->show_icon = 1;
         else
         {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -583,7 +1118,8 @@ static int parse_options(int argc, char **argv, Options *opt)
         }
     }
 
-    if (!opt->help && !opt->apply && !opt->diagnose && !opt->probe && !opt->install && !opt->uninstall)
+    if (!opt->help && !opt->apply && !opt->diagnose && !opt->probe && !opt->install && !opt->uninstall &&
+        !opt->resident && !opt->hide_icon && !opt->show_icon)
     {
         fprintf(stderr, "No mode selected. Use --help.\n");
         return -1;
@@ -597,6 +1133,25 @@ int main(int argc, char **argv)
     Options opt;
     int res;
     int code = 1;
+
+    /* A console-subsystem exe gets a console window allocated whenever it's
+       launched without one, e.g. by Task Scheduler - this flashed on every
+       15-minute run. GUI subsystem was tried and reverted: cmd.exe and
+       PowerShell don't wait for a GUI-subsystem process before returning to
+       the prompt, so interactive runs raced with their own output. Instead,
+       detect whether this console was created just for us (nobody else is
+       attached to it - a shared console from an interactive shell always has
+       the shell's own process attached too) and hide only that case, before
+       it can be seen. */
+    {
+        DWORD console_pids[2];
+        if (GetConsoleProcessList(console_pids, 2) <= 1)
+        {
+            HWND console_wnd = GetConsoleWindow();
+            if (console_wnd)
+                ShowWindow(console_wnd, SW_HIDE);
+        }
+    }
 
     if (parse_options(argc, argv, &opt) != 0)
     {
@@ -612,15 +1167,39 @@ int main(int argc, char **argv)
 
     g_quiet = opt.quiet;
 
-    if (!opt.install && !opt.uninstall)
-        g_apply_log = open_log_file("apply.log");
+    if (opt.reinstall)
+    {
+        reinstall_and_notify();
+        return 0;
+    }
 
     if (opt.install || opt.uninstall)
     {
         if (opt.install)
-            return install_autostart();
+            return install_autostart(NULL, 0);
         return uninstall_autostart();
     }
+
+    if (opt.resident)
+        return run_resident();
+
+    if (opt.hide_icon || opt.show_icon)
+    {
+        int hide = opt.hide_icon;
+        HWND running = FindWindowA(RESIDENT_CLASS_NAME, NULL);
+
+        set_hide_icon_pref(hide);
+        if (running)
+            PostMessageA(running, WM_TRAYPREF, (WPARAM)hide, 0);
+
+        if (!g_quiet)
+            printf("Tray icon will be %s. %s\n",
+                hide ? "hidden" : "shown",
+                running ? "Applied immediately." : "It will apply the next time the background app starts.");
+        return 0;
+    }
+
+    g_apply_log = open_log_file("apply.log");
 
     res = hid_init();
     if (res != 0)
