@@ -1056,7 +1056,7 @@ static void print_help(const char *argv0)
 {
     printf("k400p-fn-lock - Fn Lock for Logitech K400+ (Windows)\n\n");
     printf("Usage:\n");
-    printf("  %s                    Apply Fn Lock quietly\n", argv0);
+    printf("  %s                    Double-click: reinstall autostart and apply Fn Lock, report as a toast\n", argv0);
     printf("  %s --apply [--quiet]   Universal HID++ sweep (all receivers, slots 1-6 + FF)\n", argv0);
     printf("  %s --apply --wait      Wait for dongle, retry (autostart mode)\n", argv0);
     printf("  %s --diagnose          Apply with verbose output\n", argv0);
