@@ -33,7 +33,7 @@ Fn Lock is sent to **all Logitech HID++ receivers** and **device slots 1–6 + F
 
 Fn Lock is a volatile setting held by the receiver/keyboard firmware — it's not read back or verified, only resent — and it can drop after sleep/resume or a receiver reconnect. Earlier versions covered this with a Task Scheduler task that re-launched the exe on a timer. That worked, but every launch is a console-subsystem process, and Windows briefly creates (and can foreground) a console window for it even when nothing is printed — enough to kick a fullscreen game out to the desktop.
 
-`--install` instead adds a registry `Run` entry (`HKCU\...\CurrentVersion\Run`, no admin rights needed) that starts `k400p-fn-lock.exe --resident` once at logon and leaves it running for the session — a small tray icon (right-click for "Reapply now" / "Exit") is the only visible trace. Inside, a hidden message-only window reacts immediately to real OS events — session unlock and resume-from-sleep — instead of guessing on a timer, with a 15-minute timer kept only as a fallback. Because it's one long-lived process instead of a new one every 15 minutes, no window is ever created after the initial (also hidden) logon launch.
+`--install` instead adds a registry `Run` entry (`HKCU\...\CurrentVersion\Run`, no admin rights needed) that starts `k400p-fn-lock.exe --resident` once at logon and leaves it running for the session — a small tray icon (right-click for "Reapply Fn Lock now" / "About" / "Exit") is the only visible trace. Inside, a hidden message-only window reacts immediately to real OS events — session unlock and resume-from-sleep — instead of guessing on a timer, with a 15-minute timer kept only as a fallback. Because it's one long-lived process instead of a new one every 15 minutes, no window is ever created after the initial (also hidden) logon launch.
 
 `--uninstall` removes the registry entry and signals any running instance to exit. Both commands also clean up the old scheduled task from earlier versions if present.
 
@@ -63,6 +63,10 @@ gcc main.c hidapi/windows/hid.c app_res.o -o dist/k400p-fn-lock.exe -I hidapi/in
 `app.ico` / `app.rc` provide the tray icon (also shown as the exe's own icon in Explorer) as a compiled-in resource — both build paths need the resource compiler step (`rc` for MSVC, `windres` for MinGW) before the main build. `app.rc` also embeds `app.manifest`, which declares a dependency on ComCtl32 v6 — needed for the About box's SysLink hyperlinks; without it Windows loads the older ComCtl32 v5, which predates that control entirely.
 
 Windows still allocates a console window for this console-subsystem exe whenever it's launched without one (e.g. the one-time logon launch of `--resident`). On startup the binary checks whether it owns its console exclusively (`GetConsoleProcessList`); if so, nobody else could be using it, meaning Windows just created it for this launch, so it's hidden immediately (`ShowWindow(..., SW_HIDE)`) before it can flash. Run from a terminal, the console is shared with that shell and is left alone, so interactive use (`--diagnose`, `--help`, ...) is unaffected.
+
+## Third-party code
+
+- [hidapi](https://github.com/libusb/hidapi) (`hidapi/`, Windows backend only) provides the raw HID++ read/write calls to the receiver. Vendored as source, not a DLL dependency, under hidapi's own dual/tri-license (GPLv3 / BSD-style / original HIDAPI license, user's choice — see the header comment in `hidapi/windows/hid.c`).
 
 ## Inspiration
 
