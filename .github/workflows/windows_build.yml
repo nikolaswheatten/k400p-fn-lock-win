@@ -34,7 +34,8 @@ jobs:
         copy dist\k400p-fn-lock.exe release\
         copy README.md release\
         copy LICENSE release\
-        powershell Compress-Archive -Path release\* -DestinationPath k400p-fn-lock-win-${{ github.ref_name }}.zip
+        $safeRef = "${{ github.ref_name }}" -replace '[\\/]', '-'
+        powershell Compress-Archive -Path release\* -DestinationPath "k400p-fn-lock-win-$safeRef.zip"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v7
